@@ -1,0 +1,15 @@
+include: _default_template_yaml
+task: "vstar_bench_cot_image_only"
+generation_kwargs:
+  max_new_tokens: 16
+  temperature: 0
+  top_p: 1.0
+  num_beams: 1
+  do_sample: false
+  image_gen_pre_prompt: "<image_start>"
+  image_gen_post_prompt: "</image_start>"
+lmms_eval_specific_kwargs:
+  metric_list:
+  - metric: vstar_overall_acc
+    aggregation: !function utils.vstar_aggregate_results
+    higher_is_better: true

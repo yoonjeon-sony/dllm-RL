@@ -1,0 +1,10 @@
+dataset_path: nyu-visionx/CV-Bench
+dataset_name: "default"
+task: "cv_bench_cot_image_only"
+test_split: test
+include: _default_template_yaml
+generation_kwargs:
+  max_new_tokens: 1024
+  image_gen_pre_prompt: "<image_start>"
+  image_gen_post_prompt: "</image_start>"
+  

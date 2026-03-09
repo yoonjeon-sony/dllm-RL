@@ -1,0 +1,9 @@
+.claude
+.venv
+build
+data
+dataset
+llava.egg-info
+outputs
+slurm-logs
+wandb

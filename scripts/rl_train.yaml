@@ -1,0 +1,80 @@
+#----------------------------------------------------------------------------------------------------
+# ModelConfig
+use_peft: false
+dtype: bfloat16
+load_in_4bit: false
+model_path: null
+
+attn_implementation: sdpa
+
+# GRPOConfig
+dataset: thinkmorph_edit
+seed: 42
+bf16: true
+
+sync_ref_model: False
+
+adam_beta1: 0.9
+adam_beta2: 0.99
+weight_decay: 0.1
+max_grad_norm: 0.2
+
+use_vllm: false
+vllm_device: auto
+vllm_gpu_memory_utilization: 0.9
+loss_type: grpo
+
+warmup_ratio: 0.0001
+logging_steps: 1
+learning_rate: 3e-6
+lr_scheduler_type: constant_with_warmup
+
+num_generations: 8
+num_train_epochs: 1
+
+per_device_eval_batch_size: 1
+per_device_train_batch_size: 8
+gradient_accumulation_steps: 2
+
+
+gradient_checkpointing: false
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+
+resume_from_checkpoint: true
+run_name: null
+output_dir: null
+
+# Parameters for saving checkpoints
+save_steps: 50
+save_strategy: steps
+save_total_limit: 10 
+eval_parquet_dir: "/group2/dgm/yoonjeon/data/"
+eval_steps: 50
+
+# Diffusion and GRPO-specific
+max_completion_length: 512
+max_prompt_length: 512
+block_length: 32
+diffusion_steps: 256
+generation_batch_size: null
+remasking: low_confidence
+log_completions: True
+dynamic_threshold: 0.90
+random_masking: True
+p_mask_prompt: 0.15
+beta: 0
+epsilon: 0.2
+num_iterations: 8
+temperature: 0.8
+ppo_mini_batch_size: null  # tasks per PPO mini-batch; null disables splitting
+
+# Interleaved generation settings
+mode: "interleaved"  # "interleaved" or "interleaved_region"
+do_plan: False  # Whether to generate a planning step first
+conf_policy: "stratified"  # Confidence policy: "mmada", "mask_git", "stratified"
+enable_stratified: True
+edit_mode: 0  # 0, 1, 2, 3 -> different unconditional types
+guidance_scale: 1.2  # CFG scale for text conditioning
+guidance_scale_image: 1.4  # CFG scale for image conditioning
+rotatedDiff_key: "rotatedDiff"  # Key in data for rotated rect (for interleaved_region mode)

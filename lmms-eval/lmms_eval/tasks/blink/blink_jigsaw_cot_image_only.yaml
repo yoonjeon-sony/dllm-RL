@@ -1,0 +1,9 @@
+dataset_name: "Jigsaw"
+tag: "blink_groups"
+task: "blink_jigsaw_cot_image_only"
+test_split: test
+include: _default_template_yaml
+generation_kwargs:
+  max_new_tokens: 1024
+  image_gen_pre_prompt: "<image_start>"
+  image_gen_post_prompt: "</image_start>"

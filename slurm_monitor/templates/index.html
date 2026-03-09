@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SLURM Monitor</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg2: #161b22;
+    --bg3: #21262d;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --text-dim: #8b949e;
+    --green: #3fb950;
+    --yellow: #d29922;
+    --red: #f85149;
+    --blue: #58a6ff;
+    --orange: #d18616;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', Consolas, monospace;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  /* Header */
+  .header {
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    padding: 10px 20px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 48px;
+  }
+  .header h1 { font-size: 15px; font-weight: 600; }
+  .header .status { font-size: 12px; color: var(--text-dim); }
+
+  /* Layout */
+  .main {
+    display: flex;
+    height: calc(100vh - 48px);
+  }
+
+  /* Left Panel - Job List */
+  .panel-left {
+    width: 300px;
+    min-width: 250px;
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    background: var(--bg2);
+  }
+  .panel-title {
+    padding: 12px 16px;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-dim);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .panel-title button {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    padding: 2px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 11px;
+    font-family: inherit;
+  }
+  .panel-title button:hover { color: var(--text); border-color: var(--text-dim); }
+
+  .job-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 4px 0;
+  }
+  .job-item {
+    padding: 8px 16px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    border-left: 3px solid transparent;
+    transition: background 0.1s;
+  }
+  .job-item:hover { background: var(--bg3); }
+  .job-item.active { background: var(--bg3); border-left-color: var(--blue); }
+
+  .job-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .job-dot.running { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .job-dot.pending { background: var(--yellow); }
+  .job-dot.crashed { background: var(--red); }
+  .job-dot.completed { background: var(--text-dim); }
+
+  .job-info { flex: 1; min-width: 0; }
+  .job-id { font-size: 13px; font-weight: 600; }
+  .job-name {
+    font-size: 11px;
+    color: var(--text-dim);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .job-meta { font-size: 10px; color: var(--text-dim); }
+
+  .job-state {
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-weight: 600;
+    flex-shrink: 0;
+  }
+  .job-state.running { background: rgba(63,185,80,0.15); color: var(--green); }
+  .job-state.pending { background: rgba(210,153,34,0.15); color: var(--yellow); }
+  .job-state.crashed { background: rgba(248,81,73,0.15); color: var(--red); }
+  .job-state.completed { background: rgba(139,148,158,0.15); color: var(--text-dim); }
+
+  /* Center Panel - Log Viewer */
+  .panel-center {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .log-tabs {
+    display: flex;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg2);
+  }
+  .log-tab {
+    padding: 8px 20px;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-dim);
+    border-bottom: 2px solid transparent;
+    transition: color 0.1s;
+  }
+  .log-tab:hover { color: var(--text); }
+  .log-tab.active { color: var(--blue); border-bottom-color: var(--blue); }
+
+  .log-toolbar {
+    display: flex;
+    padding: 6px 12px;
+    gap: 8px;
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    align-items: center;
+  }
+  .log-toolbar input {
+    flex: 1;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 4px 10px;
+    border-radius: 4px;
+    font-family: inherit;
+    font-size: 12px;
+    outline: none;
+  }
+  .log-toolbar input:focus { border-color: var(--blue); }
+  .log-toolbar label {
+    font-size: 11px;
+    color: var(--text-dim);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .log-toolbar .match-count {
+    font-size: 11px;
+    color: var(--text-dim);
+    white-space: nowrap;
+  }
+
+  .log-viewer {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 0;
+    font-size: 12px;
+    line-height: 1.6;
+    background: var(--bg);
+  }
+  .log-viewer .log-line {
+    padding: 0 16px;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .log-viewer .log-line:hover { background: var(--bg2); }
+  .log-viewer .log-line .highlight {
+    background: rgba(210,153,34,0.4);
+    border-radius: 2px;
+  }
+  .log-viewer .empty-state {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    color: var(--text-dim);
+    font-size: 14px;
+  }
+  .log-streaming-indicator {
+    padding: 4px 12px;
+    font-size: 11px;
+    color: var(--green);
+    background: var(--bg2);
+    border-top: 1px solid var(--border);
+    display: none;
+  }
+  .log-streaming-indicator.active { display: block; }
+
+  /* Right Panel - GPU */
+  .panel-right {
+    width: 340px;
+    min-width: 280px;
+    border-left: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    background: var(--bg2);
+    overflow-y: auto;
+  }
+  .gpu-job-group {
+    border-bottom: 1px solid var(--border);
+  }
+  .gpu-job-header {
+    padding: 8px 16px;
+    background: var(--bg3);
+    font-size: 11px;
+    font-weight: 600;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid var(--border);
+  }
+  .gpu-job-header .job-label { color: var(--blue); }
+  .gpu-job-header .node-label { color: var(--text-dim); font-weight: 400; }
+  .gpu-card {
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .gpu-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+  }
+  .gpu-name { font-size: 12px; font-weight: 600; }
+  .gpu-temp { font-size: 11px; }
+  .gpu-temp.cool { color: var(--green); }
+  .gpu-temp.warm { color: var(--yellow); }
+  .gpu-temp.hot { color: var(--orange); }
+  .gpu-temp.critical { color: var(--red); }
+
+  .gpu-bar-container {
+    margin: 6px 0;
+  }
+  .gpu-bar-label {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-bottom: 3px;
+  }
+  .gpu-bar {
+    height: 6px;
+    background: var(--bg);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .gpu-bar-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.5s ease;
+  }
+  .gpu-bar-fill.util { background: var(--green); }
+  .gpu-bar-fill.util.high { background: var(--yellow); }
+  .gpu-bar-fill.util.critical { background: var(--red); }
+  .gpu-bar-fill.mem { background: var(--blue); }
+  .gpu-bar-fill.mem.high { background: var(--orange); }
+  .gpu-bar-fill.mem.critical { background: var(--red); }
+
+  .gpu-power {
+    font-size: 10px;
+    color: var(--text-dim);
+    margin-top: 4px;
+  }
+
+  .gpu-error {
+    padding: 20px 16px;
+    color: var(--text-dim);
+    font-size: 12px;
+    text-align: center;
+  }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--bg3); border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--border); }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>SLURM Monitor</h1>
+  <span class="status" id="header-status">Loading...</span>
+</div>
+
+<div class="main">
+  <!-- Left Panel: Jobs -->
+  <div class="panel-left">
+    <div class="panel-title">
+      Jobs
+      <button onclick="refreshJobs()">Refresh</button>
+    </div>
+    <div class="job-list" id="job-list"></div>
+  </div>
+
+  <!-- Center Panel: Logs -->
+  <div class="panel-center">
+    <div class="log-tabs" id="log-tabs">
+      <div class="log-tab active" data-type="output" onclick="switchLogTab('output')">stdout</div>
+      <div class="log-tab" data-type="error" onclick="switchLogTab('error')">stderr</div>
+    </div>
+    <div class="log-toolbar">
+      <input type="text" id="log-search" placeholder="Search logs..." oninput="filterLogs()">
+      <span class="match-count" id="match-count"></span>
+      <label><input type="checkbox" id="auto-scroll" checked> Auto-scroll</label>
+    </div>
+    <div class="log-viewer" id="log-viewer">
+      <div class="empty-state">Select a job to view logs</div>
+    </div>
+    <div class="log-streaming-indicator" id="streaming-indicator">
+      &#9679; Streaming live...
+    </div>
+  </div>
+
+  <!-- Right Panel: GPU -->
+  <div class="panel-right">
+    <div class="panel-title">
+      GPU Usage
+      <button onclick="refreshGpu()">Refresh</button>
+    </div>
+    <div id="gpu-list">
+      <div class="gpu-error">Loading GPU info...</div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+let currentJobId = null;
+let currentLogType = 'output';
+let logLines = [];          // raw lines for current view
+let eventSource = null;
+let gpuInterval = null;
+let jobInterval = null;
+
+// ---------------------------------------------------------------------------
+// Jobs
+// ---------------------------------------------------------------------------
+async function refreshJobs() {
+  try {
+    const resp = await fetch('/api/jobs');
+    const jobs = await resp.json();
+    renderJobs(jobs);
+    document.getElementById('header-status').textContent =
+      `${jobs.filter(j => j.state === 'RUNNING').length} running, ` +
+      `${jobs.filter(j => j.state === 'PENDING').length} pending | ` +
+      new Date().toLocaleTimeString();
+  } catch (e) {
+    document.getElementById('header-status').textContent = 'Error fetching jobs';
+  }
+}
+
+function renderJobs(jobs) {
+  const list = document.getElementById('job-list');
+  list.innerHTML = '';
+  if (jobs.length === 0) {
+    list.innerHTML = '<div style="padding:20px;color:var(--text-dim);font-size:12px;text-align:center">No jobs found</div>';
+    return;
+  }
+  jobs.forEach(job => {
+    const el = document.createElement('div');
+    el.className = 'job-item' + (job.id === currentJobId ? ' active' : '');
+    const stateClass = job.state === 'RUNNING' ? 'running'
+      : job.state === 'PENDING' ? 'pending'
+      : job.state === 'CRASHED' ? 'crashed' : 'completed';
+
+    el.innerHTML = `
+      <div class="job-dot ${stateClass}"></div>
+      <div class="job-info">
+        <div class="job-id">${job.id}</div>
+        <div class="job-name">${job.name || '(unknown)'}</div>
+        <div class="job-meta">${job.time ? job.time : ''} ${job.nodelist ? '@ ' + job.nodelist : ''}</div>
+      </div>
+      <span class="job-state ${stateClass}">${job.state}</span>
+    `;
+    el.onclick = () => selectJob(job);
+    list.appendChild(el);
+  });
+}
+
+function selectJob(job) {
+  currentJobId = job.id;
+  // Update active state
+  document.querySelectorAll('.job-item').forEach(el => el.classList.remove('active'));
+  event.currentTarget.classList.add('active');
+  // Load logs
+  loadLogs(job.id, currentLogType);
+}
+
+// ---------------------------------------------------------------------------
+// Logs
+// ---------------------------------------------------------------------------
+function switchLogTab(type) {
+  currentLogType = type;
+  document.querySelectorAll('.log-tab').forEach(t => {
+    t.classList.toggle('active', t.dataset.type === type);
+  });
+  if (currentJobId) {
+    loadLogs(currentJobId, type);
+  }
+}
+
+function loadLogs(jobId, logType) {
+  // Close existing SSE
+  if (eventSource) {
+    eventSource.close();
+    eventSource = null;
+  }
+
+  logLines = [];
+  const viewer = document.getElementById('log-viewer');
+  viewer.innerHTML = '<div class="empty-state">Loading...</div>';
+  document.getElementById('streaming-indicator').classList.remove('active');
+
+  eventSource = new EventSource(`/api/logs/${jobId}/${logType}`);
+
+  eventSource.addEventListener('initial', (e) => {
+    const text = JSON.parse(e.data);
+    logLines = text.split('\n');
+    if (logLines[logLines.length - 1] === '') logLines.pop();
+    renderLog();
+  });
+
+  eventSource.addEventListener('line', (e) => {
+    const line = JSON.parse(e.data);
+    logLines.push(line.replace(/\n$/, ''));
+    // Limit memory
+    if (logLines.length > 10000) {
+      logLines = logLines.slice(-8000);
+    }
+    appendLogLine(logLines.length - 1);
+    maybeAutoScroll();
+  });
+
+  eventSource.addEventListener('done', () => {
+    document.getElementById('streaming-indicator').classList.remove('active');
+    eventSource.close();
+    eventSource = null;
+  });
+
+  eventSource.addEventListener('open', () => {
+    document.getElementById('streaming-indicator').classList.add('active');
+  });
+
+  eventSource.onerror = () => {
+    document.getElementById('streaming-indicator').classList.remove('active');
+  };
+}
+
+function renderLog() {
+  const viewer = document.getElementById('log-viewer');
+  const search = document.getElementById('log-search').value.toLowerCase();
+  const fragment = document.createDocumentFragment();
+
+  let matchCount = 0;
+  logLines.forEach((line, i) => {
+    if (search && !line.toLowerCase().includes(search)) return;
+    if (search) matchCount++;
+    const div = document.createElement('div');
+    div.className = 'log-line';
+    if (search) {
+      div.innerHTML = highlightText(line, search);
+    } else {
+      div.textContent = line;
+    }
+    fragment.appendChild(div);
+  });
+
+  viewer.innerHTML = '';
+  if (fragment.children.length === 0 && logLines.length === 0) {
+    viewer.innerHTML = '<div class="empty-state">No log content</div>';
+  } else {
+    viewer.appendChild(fragment);
+  }
+
+  document.getElementById('match-count').textContent =
+    search ? `${matchCount} match${matchCount !== 1 ? 'es' : ''}` : '';
+
+  maybeAutoScroll();
+}
+
+function appendLogLine(index) {
+  const viewer = document.getElementById('log-viewer');
+  const search = document.getElementById('log-search').value.toLowerCase();
+  const line = logLines[index];
+
+  // Remove empty state if present
+  const empty = viewer.querySelector('.empty-state');
+  if (empty) empty.remove();
+
+  if (search && !line.toLowerCase().includes(search)) return;
+
+  const div = document.createElement('div');
+  div.className = 'log-line';
+  if (search) {
+    div.innerHTML = highlightText(line, search);
+  } else {
+    div.textContent = line;
+  }
+  viewer.appendChild(div);
+}
+
+function highlightText(text, search) {
+  if (!search) return escapeHtml(text);
+  const escaped = escapeHtml(text);
+  const escapedSearch = escapeHtml(search);
+  const regex = new RegExp(`(${escapeRegex(escapedSearch)})`, 'gi');
+  return escaped.replace(regex, '<span class="highlight">$1</span>');
+}
+
+function escapeHtml(s) {
+  const div = document.createElement('div');
+  div.textContent = s;
+  return div.innerHTML;
+}
+
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function filterLogs() {
+  renderLog();
+}
+
+function maybeAutoScroll() {
+  if (document.getElementById('auto-scroll').checked) {
+    const viewer = document.getElementById('log-viewer');
+    viewer.scrollTop = viewer.scrollHeight;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GPU
+// ---------------------------------------------------------------------------
+let gpuFetching = false;
+
+async function refreshGpu() {
+  if (gpuFetching) return;  // skip if previous request still in-flight
+  gpuFetching = true;
+  try {
+    const resp = await fetch('/api/gpu');
+    const data = await resp.json();
+    renderGpuJobs(data.jobs, data.error);
+  } catch (e) {
+    document.getElementById('gpu-list').innerHTML =
+      '<div class="gpu-error">Failed to fetch GPU info</div>';
+  } finally {
+    gpuFetching = false;
+  }
+}
+
+function renderGpuJobs(jobs, error) {
+  const container = document.getElementById('gpu-list');
+
+  if (!jobs || jobs.length === 0) {
+    container.innerHTML = `<div class="gpu-error">${error || 'No running jobs with GPUs'}</div>`;
+    return;
+  }
+
+  container.innerHTML = '';
+  jobs.forEach(job => {
+    const group = document.createElement('div');
+    group.className = 'gpu-job-group';
+
+    const header = document.createElement('div');
+    header.className = 'gpu-job-header';
+    header.innerHTML = `
+      <span class="job-label">Job ${job.job_id}${job.job_name ? ' - ' + escapeHtml(job.job_name) : ''}</span>
+      <span class="node-label">${escapeHtml(job.nodelist)}</span>
+    `;
+    group.appendChild(header);
+
+    if (job.error || !job.gpus || job.gpus.length === 0) {
+      const err = document.createElement('div');
+      err.className = 'gpu-error';
+      err.textContent = job.error || 'No GPU data';
+      group.appendChild(err);
+    } else {
+      job.gpus.forEach(gpu => {
+        const memPct = gpu.mem_total > 0 ? (gpu.mem_used / gpu.mem_total * 100) : 0;
+        const utilClass = gpu.gpu_util > 90 ? 'critical' : gpu.gpu_util > 70 ? 'high' : '';
+        const memClass = memPct > 90 ? 'critical' : memPct > 70 ? 'high' : '';
+        const tempClass = gpu.temperature >= 85 ? 'critical'
+          : gpu.temperature >= 75 ? 'hot'
+          : gpu.temperature >= 60 ? 'warm' : 'cool';
+
+        const card = document.createElement('div');
+        card.className = 'gpu-card';
+        card.innerHTML = `
+          <div class="gpu-header">
+            <span class="gpu-name">GPU ${gpu.index}: ${gpu.name}</span>
+            <span class="gpu-temp ${tempClass}">${gpu.temperature}&deg;C</span>
+          </div>
+          <div class="gpu-bar-container">
+            <div class="gpu-bar-label">
+              <span>Utilization</span>
+              <span>${gpu.gpu_util.toFixed(0)}%</span>
+            </div>
+            <div class="gpu-bar">
+              <div class="gpu-bar-fill util ${utilClass}" style="width:${gpu.gpu_util}%"></div>
+            </div>
+          </div>
+          <div class="gpu-bar-container">
+            <div class="gpu-bar-label">
+              <span>Memory</span>
+              <span>${(gpu.mem_used/1024).toFixed(1)} / ${(gpu.mem_total/1024).toFixed(1)} GB</span>
+            </div>
+            <div class="gpu-bar">
+              <div class="gpu-bar-fill mem ${memClass}" style="width:${memPct}%"></div>
+            </div>
+          </div>
+          <div class="gpu-power">Power: ${gpu.power} W</div>
+        `;
+        group.appendChild(card);
+      });
+    }
+
+    container.appendChild(group);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+refreshJobs();
+refreshGpu();
+jobInterval = setInterval(refreshJobs, 10000);   // every 10s
+gpuInterval = setInterval(refreshGpu, 5000);      // every 5s
+</script>
+</body>
+</html>
