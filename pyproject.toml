@@ -3,11 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "llava"
+name = "vlm-env"
 version = "0.1.0"
-description = "llava"
-readme = "README.md"
-requires-python = "==3.11.*"
+requires-python = ">=3.11"
 
 dependencies = [
   "torch",
@@ -38,11 +36,15 @@ dependencies = [
   "jaxtyping",
   "typeguard",
   "trl",
-  "xformers==0.0.31",
-
+  "xformers",
+  "transformers==4.53.3",
   # logical dependency name (must match lmms-eval's project.name)
   "lmms-eval",
 ]
 
+
 [tool.uv.sources]
 lmms-eval = { path = "lmms-eval", editable = true }
+
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch"]
