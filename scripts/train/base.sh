@@ -1,4 +1,10 @@
 # replace with 256 checkpoint
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 || command -v python || true)}"
+if [[ -z "${PYTHON_BIN}" ]]; then
+    echo "python3/python not found in PATH. Activate your environment before launch."
+    exit 127
+fi
+
 LLADA_8B_INSTRUCT=/mnt/localssd/lavida-llada-v1.0-instruct-gen-converted-v3-2048
 VISION_MODEL_VERSION="/mnt/localssd/siglip-so400m-patch14-384"
 
@@ -40,7 +46,7 @@ echo "RANK: ${RANK}"
 echo "NUM_GPUS: ${NUM_GPUS}"
 echo "MASTER_ADDR: ${MASTER_ADDR}"
 echo "MASTER_PORT: ${MASTER_PORT}"
-torchrun \
+"${PYTHON_BIN}" -m torch.distributed.run \
     --nnodes=${WORLD_SIZE} \
     --node_rank ${RANK} \
     --nproc_per_node="${NUM_GPUS}"  \
@@ -69,6 +75,7 @@ torchrun \
     --mm_resampler_type spatial_pool \
     --mm_spatial_pool_out_channels 1152 \
     --add_loc_tokens \
+    --add_vision_tokens \
     --bf16 True \
     --run_name $MID_RUN_NAME \
     --output_dir "/mnt/localssd/outputdir/${MID_RUN_NAME}" \
@@ -109,5 +116,3 @@ torchrun \
     --t2i_eval True \
     --policy cosine \
     ${@} \
-
-

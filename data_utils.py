@@ -169,6 +169,14 @@ GROUNDING_PROMPT = (
 EDIT_PROMPT = (
     "Edit the region where auxiliary line, box, or drawing could help solve the following problem."
 )
+'''Generation Instructions: You should first think about the reasoning process in the mind and then provide the user with the answer. 
+The reasoning process is enclosed within <think> </think> tags, i.e. <think> reasoning process here </think> answer here'''
+
+INTERLEAVE_PROMPT = (
+    "Let's think step-by-step to solve the question."
+    "If visual aid is needed, use <vision_start> <vision_end> tags for image editing."
+    "Put your final answer in <answer> <\answer> tags."
+)
 
 def _build_question_prompt(question):
     return (

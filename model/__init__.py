@@ -9,14 +9,16 @@
 # Dissemination of this information or reproduction of this material
 # is strictly forbidden unless prior written permission is obtained
 # from Adobe.
-
+from .modeling_magvitv2 import VQGANEncoder, VQGANDecoder, LFQuantizer, MAGVITv2
+from .sampling import *
+from .modeling_mmada import MMadaModelLM, MMadaConfig
 import os
 
 AVAILABLE_MODELS = {
-    "llava_llama": "LlavaLlamaForCausalLM, LlavaConfig",
-    "llava_qwen": "LlavaQwenForCausalLM, LlavaQwenConfig",
-    "llava_mistral": "LlavaMistralForCausalLM, LlavaMistralConfig",
-    "llava_mixtral": "LlavaMixtralForCausalLM, LlavaMixtralConfig",
+    # "llava_llama": "LlavaLlamaForCausalLM, LlavaConfig",
+    # "llava_qwen": "LlavaQwenForCausalLM, LlavaQwenConfig",
+    # "llava_mistral": "LlavaMistralForCausalLM, LlavaMistralConfig",
+    # "llava_mixtral": "LlavaMixtralForCausalLM, LlavaMixtralConfig",
     "llava_llada":"LlavaLladaForMaskedDiffusion, LlavaLladaConfig"
     # "llava_qwen_moe": "LlavaQwenMoeForCausalLM, LlavaQwenMoeConfig",    
     # Add other models as needed

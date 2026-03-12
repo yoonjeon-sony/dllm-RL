@@ -9,7 +9,6 @@ requires-python = ">=3.11"
 
 dependencies = [
   "torch",
-  "flash-attn",
   "tqdm",
   "numpy",
   "scipy",
@@ -38,13 +37,8 @@ dependencies = [
   "trl",
   "xformers",
   "transformers==4.53.3",
-  # logical dependency name (must match lmms-eval's project.name)
   "lmms-eval",
 ]
 
-
 [tool.uv.sources]
 lmms-eval = { path = "lmms-eval", editable = true }
-
-[tool.uv.extra-build-dependencies]
-flash-attn = ["torch"]

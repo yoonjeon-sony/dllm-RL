@@ -459,6 +459,12 @@ class DiffuGRPOConfig(GRPOConfig):
         default="/group2/dgm/yoonjeon/data",
         metadata={"help": "Root directory for images."},
     )
+    return_debug_artifacts: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to return image generation debug artifacts during rollout generation."
+        },
+    )
 
     # Mid-training lmms-eval evaluation
     eval_tasks: Optional[str] = field(

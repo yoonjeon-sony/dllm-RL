@@ -48,7 +48,6 @@ from llava.model.builder import load_pretrained_model
 from llava.mm_utils import process_highres_image, process_anyres_image, process_highres_image_crop_split, tokenizer_image_token
 from llava.utils import rank0_print, process_video_with_pyav, process_video_with_decord
 from llava.model.language_model.llava_llada import LlavaLladaForMaskedDiffusion
-from llava.model.language_model.llava_dream import LlavaDreamForMaskedDiffusion
 
 from torch.utils.data import ConcatDataset
 
@@ -200,6 +199,7 @@ class TrainingArguments(transformers.TrainingArguments):
     t2i_eval:  bool = False
     eval_only: bool = False
     add_loc_tokens: bool = False
+    add_vision_tokens: bool = False
     lmms_eval_extra_tasks: str = ""
     lmms_eval_limit: int = field(default=-1, metadata={"help": "Limit number of samples per eval task (-1 for no limit)"})
     group_by_random_length: bool = field(default=False)
@@ -653,6 +653,13 @@ def train(model_path=None, attn_implementation=None):
         special_tokens = list([f'<LOC_{i}>' for i in range(1025)])
         special_tokens.extend(['<box_p>','</box_p>','<LOC_BEGIN>','<LOC_END>'])
         tokenizer.add_special_tokens(dict(additional_special_tokens=special_tokens))
+        model.config.get_text_config(decoder=True).tie_word_embeddings = False
+        model.resize_token_embeddings(len(tokenizer))
+
+    if training_args.add_vision_tokens:
+        tokenizer.add_special_tokens(
+            dict(additional_special_tokens=["<vision_start>", "<vision_end>"])
+        )
         model.config.get_text_config(decoder=True).tie_word_embeddings = False
         model.resize_token_embeddings(len(tokenizer))
 

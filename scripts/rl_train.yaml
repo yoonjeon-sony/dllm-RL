@@ -1,7 +1,7 @@
 #----------------------------------------------------------------------------------------------------
 # ModelConfig
 use_peft: false
-dtype: bfloat16
+torch_dtype: bfloat16
 load_in_4bit: false
 model_path: null
 

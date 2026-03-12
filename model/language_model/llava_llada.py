@@ -17,6 +17,7 @@ DO_DEBUG = os.environ.get('DO_DEBUG',False)
 SKIP_COMPLEMENTARY_MASKING = os.environ.get("SKIP_COMPLEMENTARY_MASKING", False)
 import re
 from typing import List, Optional, Tuple, Union
+import random
 
 import torch
 import torch.nn as nn
@@ -99,7 +100,7 @@ def sample_t(b,device,policy='uniform',policy_args=None):
 def forward_process(bsz,seq_len,device, eps=1e-3,policy='uniform',policy_args=None):
     b, l = bsz,seq_len
     t = sample_t(b,device,policy=policy,policy_args=policy_args)
-    # t = torch.sigmoid(t)
+
     p_mask = (1 - eps) * t + eps
     
     p_mask = p_mask[:, None]#.repeat(1, l)
@@ -107,10 +108,7 @@ def forward_process(bsz,seq_len,device, eps=1e-3,policy='uniform',policy_args=No
     masked_indices = torch.rand((b, l), device=device)
     mask_cutoff =  torch.max(p_mask,masked_indices.min(-1,keepdim=True).values)
     masked_indices = masked_indices <= mask_cutoff
-    # mask at least one token
-    # 126336 is used for [MASK] token
-    #noisy_batch = torch.where(masked_indices, 126336, input_ids)
-    
+
     return masked_indices, p_mask
 
 
@@ -144,6 +142,126 @@ def _top_k_top_p_filtering(
 
     return logits
 
+
+def stratified_random(n: int = 64, seed: Optional[int] = None, shuffle_blocks: bool = True) -> List[int]:
+    """
+    Progressive Multi‑Jittered (PMJ) ordering over an n×n integer grid, n must be a power of two.
+
+    The algorithm recursively subdivides the full grid into 2×2 blocks. At each level, it ensures
+    every sub‑block contains exactly one sample by placing a new integer‑grid point uniformly at
+    random in each sub‑block that doesn't already contain a sample from a previous level. The
+    resulting sequence is progressive: the first 4^k samples are 1‑per‑cell stratified over a
+    (n/2^k)×(n/2^k) tiling of the domain.
+
+    Returns
+    -------
+    List[int]
+        Row‑major linear indices y*n + x for x,y in [0, n).
+    """
+    # Validate power of two
+    if n <= 0 or (n & (n - 1)) != 0:
+        raise ValueError("n must be a positive power of two (e.g., 64)")
+
+    rng = random.Random(seed)
+
+    # Occupancy grid: False means empty, True means already sampled
+    occupied = [[False] * n for _ in range(n)]
+
+    # The progressive sequence (row‑major linear indices)
+    seq: List[int] = []
+
+    # A block is represented as (x0, y0, size)
+    blocks: List[Tuple[int, int, int]] = [(0, 0, n)]
+
+    def block_has_sample(x0: int, y0: int, size: int) -> bool:
+        for yy in range(y0, y0 + size):
+            row = occupied[yy]
+            for xx in range(x0, x0 + size):
+                if row[xx]:
+                    return True
+        return False
+
+    def place_random_in_block(x0: int, y0: int, size: int):
+        # Because we only call this on blocks known to be empty, a single draw suffices.
+        x = rng.randrange(x0, x0 + size)
+        y = rng.randrange(y0, y0 + size)
+        # Safety: loop until we hit an empty cell (should be first try for empty block)
+        attempts = 0
+        while occupied[y][x]:
+            x = rng.randrange(x0, x0 + size)
+            y = rng.randrange(y0, y0 + size)
+            attempts += 1
+            if attempts > 10000:
+                raise RuntimeError("Too many attempts to place a sample; logic error?")
+        occupied[y][x] = True
+        seq.append(y * n + x)
+
+    # Iterate levels until block size == 1
+    size = n
+    while size > 1:
+        # Subdivide each block into 4 children
+        half = size // 2
+        children: List[Tuple[int, int, int]] = []
+        for (x0, y0, s) in blocks:
+            assert s == size
+            children.extend([
+                (x0, y0, half),                # NW
+                (x0 + half, y0, half),         # NE
+                (x0, y0 + half, half),         # SW
+                (x0 + half, y0 + half, half),  # SE
+            ])
+        # Optionally randomize visitation order to reduce directional bias in sequence order
+        if shuffle_blocks:
+            rng.shuffle(children)
+        # For each child, if empty, place a random sample inside it
+        for (x0, y0, s) in children:
+            if not block_has_sample(x0, y0, s):
+                place_random_in_block(x0, y0, s)
+        # Next level
+        blocks = children
+        size = half
+
+    # At this point, every 1×1 cell is a block; any still‑empty cells need to be appended
+    # (these are exactly those not yet selected at previous levels).
+    # To preserve the progressive property, all remaining cells are appended in a random order.
+    # (Any order works because they are all 1×1; using random makes ties less structured.)
+    remaining: List[int] = []
+    for y in range(n):
+        for x in range(n):
+            if not occupied[y][x]:
+                remaining.append(y * n + x)
+    rng.shuffle(remaining)
+    seq.extend(remaining)
+
+    assert len(seq) == n * n, (len(seq), n * n)
+
+    return seq
+
+
+def verify_progressive(seq: List[int], n: int) -> None:
+    """Debug helper: verifies the PMJ 1‑per‑cell stratification at prefix lengths 4^k."""
+    import math
+    levels = int(math.log2(n))
+    assert 2 ** levels == n
+
+    # Convert linear indices to (x, y)
+    pts = [(i % n, i // n) for i in seq]
+
+    for k in range(1, levels + 1):
+        prefix = pts[: 4 ** k]
+        size = n // (2 ** k)  # block size at level k
+        # Count how many points fall into each block
+        counts = [[0 for _ in range(2 ** k)] for __ in range(2 ** k)]
+        for (x, y) in prefix:
+            bx = x // size
+            by = y // size
+            counts[by][bx] += 1
+        # Every block must contain exactly one point
+        bad = [(by, bx, counts[by][bx])
+               for by in range(2 ** k)
+               for bx in range(2 ** k)
+               if counts[by][bx] != 1]
+        assert not bad, f"Level {k} failed blocks: {bad[:5]} (showing up to 5)"
 
 class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
     
@@ -193,274 +311,6 @@ class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
         resized = padded.resize((image_resolution, image_resolution))
         return resized, original_size
 
-    @torch.no_grad()
-    def _generate_mode(
-        self,
-        *,
-        gen_type: str,
-        tokenizer,
-        input_embeds: torch.Tensor,
-        attention_mask: torch.Tensor,
-        bbox_mask: Optional[torch.Tensor] = None,
-        input_embeds_gen: Optional[torch.Tensor] = None,
-        inputs_embeds_cond: Optional[torch.Tensor] = None,
-        inputs_embeds_uncond: Optional[torch.Tensor] = None,
-        inputs_embeds_uncond_enc: Optional[torch.Tensor] = None,
-        attention_mask_gen: Optional[torch.Tensor] = None,
-        is_gen: Optional[torch.Tensor] = None,
-        is_gen_enc: Optional[torch.Tensor] = None,
-        is_gen_enc_null: Optional[torch.Tensor] = None,
-        is_gen_enc_ccc: Optional[torch.Tensor] = None,
-        is_prompt: Optional[torch.Tensor] = None,
-        init_images: Optional[list] = None,
-        image_sizes: Optional[list] = None,
-        generation_prompts: Optional[list] = None,
-        steps: int = 128,
-        gen_length: int = 128,
-        block_length: int = 128,
-        temperature: float = 0.0,
-        cfg_scale: float = 0.0,
-        remasking: str = "low_confidence",
-        mask_id: int = 126336,
-        generation_batch_size: Optional[int] = None,
-        bbox_postprocess_fn=None,
-        reencode_fn=None,
-        image_gen_kwargs: Optional[dict] = None,
-        return_debug: bool = False,
-    ):
-        if gen_type not in ("text_gen", "image_gen", "grounding"):
-            raise ValueError(f"gen_type must be 'text_gen', 'image_gen', or 'grounding', got {gen_type!r}")
-        if attention_mask is None or input_embeds is None:
-            raise ValueError("input_embeds and attention_mask are required.")
-        if gen_type in {"grounding", "image_gen"} and bbox_mask is None:
-            raise ValueError("bbox_mask is required for grounding and image_gen modes.")
-        if gen_type == "image_gen":
-            missing = [
-                name
-                for name, val in [
-                    ("input_embeds_gen", input_embeds_gen),
-                    ("attention_mask_gen", attention_mask_gen),
-                    ("is_gen", is_gen),
-                    ("is_gen_enc", is_gen_enc),
-                    ("is_prompt", is_prompt),
-                    ("init_images", init_images),
-                ]
-                if val is None
-            ]
-            if missing:
-                raise ValueError(f"image_gen mode missing required inputs: {', '.join(missing)}")
-            if reencode_fn is None:
-                raise ValueError("reencode_fn is required for image_gen mode.")
-        if gen_type in {"grounding", "image_gen"} and bbox_postprocess_fn is None:
-            raise ValueError("bbox_postprocess_fn is required for grounding/image_gen modes.")
-
-        if generation_batch_size is None:
-            generation_batch_size = input_embeds.size(0)
-
-        base_model = self.get_model()
-        image_gen_kwargs = dict(image_gen_kwargs or {})
-        image_gen_kwargs.pop("return_debug", None)
-
-        total = input_embeds.size(0)
-        prompt_completion_ids_all = []
-        prompt_masks_all = []
-        bbox_ids_all = []
-        pred_bboxes_all = [None] * total if gen_type in {"grounding", "image_gen"} else None
-        bbox_texts_all = [None] * total if gen_type in {"grounding", "image_gen"} else None
-        edited_images_all = [None] * total if gen_type == "image_gen" else None
-        image_gen_debug_all = [None] * total if gen_type == "image_gen" else None
-
-        for i in range(0, total, generation_batch_size):
-            end_idx = min(i + generation_batch_size, total)
-            batch_input_embeds = input_embeds[i:end_idx]
-            batch_attention_mask = attention_mask[i:end_idx]
-            batch_pred_bboxes = None
-            batch_bbox_texts = None
-            batch_bbox_ids = None
-
-            if gen_type in {"grounding", "image_gen"}:
-                batch_bbox_mask = bbox_mask[i:end_idx]
-                logits = get_logits(base_model, batch_input_embeds)
-                token_ids = logits.argmax(dim=-1)
-                eos_id = tokenizer.eos_token_id
-                row_ids_list = []
-                for row_idx in range(token_ids.size(0)):
-                    row_ids = token_ids[row_idx][batch_bbox_mask[row_idx]]
-                    row_ids = row_ids[:4]
-                    if row_ids.numel() < 4:
-                        pad = torch.full(
-                            (4 - row_ids.numel(),),
-                            eos_id,
-                            dtype=torch.long,
-                            device=row_ids.device,
-                        )
-                        row_ids = torch.cat([row_ids, pad], dim=0)
-                    row_ids_list.append(row_ids.to(torch.long))
-                batch_bbox_ids = torch.stack(row_ids_list, dim=0)
-                bbox_ids_all.append(batch_bbox_ids)
-
-                post = bbox_postprocess_fn(batch_bbox_ids, list(range(i, end_idx)))
-                if isinstance(post, tuple):
-                    batch_pred_bboxes = post[0]
-                    if len(post) > 1:
-                        batch_bbox_texts = post[1]
-                else:
-                    batch_pred_bboxes = post
-
-                if batch_pred_bboxes is not None:
-                    for row_idx, pred_box in enumerate(batch_pred_bboxes):
-                        pred_bboxes_all[i + row_idx] = pred_box
-                if batch_bbox_texts is not None:
-                    for row_idx, txt in enumerate(batch_bbox_texts):
-                        bbox_texts_all[i + row_idx] = txt
-
-            if gen_type == "image_gen":
-                batch_images = init_images[i:end_idx]
-                batch_image_sizes = image_sizes[i:end_idx] if image_sizes is not None else None
-                batch_input_embeds_gen = input_embeds_gen[i:end_idx]
-                batch_inputs_embeds_cond = inputs_embeds_cond[i:end_idx] if inputs_embeds_cond is not None else None
-                batch_inputs_embeds_uncond = inputs_embeds_uncond[i:end_idx] if inputs_embeds_uncond is not None else None
-                batch_inputs_embeds_uncond_enc = (
-                    inputs_embeds_uncond_enc[i:end_idx] if inputs_embeds_uncond_enc is not None else None
-                )
-                batch_attention_mask_gen = attention_mask_gen[i:end_idx]
-                batch_is_gen = is_gen[i:end_idx]
-                batch_is_gen_enc = is_gen_enc[i:end_idx]
-                batch_is_gen_enc_null = is_gen_enc_null[i:end_idx] if is_gen_enc_null is not None else None
-                batch_is_gen_enc_ccc = is_gen_enc_ccc[i:end_idx] if is_gen_enc_ccc is not None else None
-                batch_is_prompt = is_prompt[i:end_idx]
-
-                if return_debug:
-                    batch_edited_images, batch_image_debug = self.generate_image(
-                        init_images=batch_images,
-                        inputs_embeds=batch_input_embeds_gen,
-                        inputs_embeds_cond=batch_inputs_embeds_cond,
-                        inputs_embeds_uncond=batch_inputs_embeds_uncond,
-                        inputs_embeds_uncond_enc=batch_inputs_embeds_uncond_enc,
-                        is_gen=batch_is_gen,
-                        is_gen_enc=batch_is_gen_enc,
-                        is_gen_enc_null=batch_is_gen_enc_null,
-                        is_gen_enc_ccc=batch_is_gen_enc_ccc,
-                        is_prompt=batch_is_prompt,
-                        attention_mask=batch_attention_mask_gen,
-                        pred_bboxes=batch_pred_bboxes,
-                        image_sizes=batch_image_sizes,
-                        return_debug=True,
-                        **image_gen_kwargs,
-                    )
-                else:
-                    batch_edited_images = self.generate_image(
-                        init_images=batch_images,
-                        inputs_embeds=batch_input_embeds_gen,
-                        inputs_embeds_cond=batch_inputs_embeds_cond,
-                        inputs_embeds_uncond=batch_inputs_embeds_uncond,
-                        inputs_embeds_uncond_enc=batch_inputs_embeds_uncond_enc,
-                        is_gen=batch_is_gen,
-                        is_gen_enc=batch_is_gen_enc,
-                        is_gen_enc_null=batch_is_gen_enc_null,
-                        is_gen_enc_ccc=batch_is_gen_enc_ccc,
-                        is_prompt=batch_is_prompt,
-                        attention_mask=batch_attention_mask_gen,
-                        pred_bboxes=batch_pred_bboxes,
-                        image_sizes=batch_image_sizes,
-                        **image_gen_kwargs,
-                    )
-                    batch_image_debug = None
-
-                for row_idx, edited_image in enumerate(batch_edited_images):
-                    edited_images_all[i + row_idx] = edited_image
-
-                if generation_prompts is None:
-                    raise ValueError("generation_prompts is required for image_gen mode.")
-                batch_generation_prompts = generation_prompts[i:end_idx]
-                batch_all_images = [[orig, edited] for orig, edited in zip(batch_images, batch_edited_images)]
-                # TODO: Append the edited image into conv.roles[1] (assistant) and continue text generation from this prompt.
-                """ 
-                    conv.append_message(conv.roles[0], f"<image> {reserve_token_2*enc_embeddings.shape[1]}\n {prompt} ")
-                    reserve_token = '<|reserved_token_5|>'
-                    conv.append_message(conv.roles[1], f"{plan}{reserve_token*n_tokens_txt}")
-                    prompt_question = conv.get_prompt()
-                    prompt_question.removesuffix('<|start_header_id|>assistant<|end_header_id|>\n\n') # TODO: Should remove this line to continue text gen.
-                    print(prompt_question.replace('<|reserved_token_5|>','*').replace('<|reserved_token_6|>','*'))
-                    input_ids = tokenizer_image_token(prompt_question, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(model.device)
-                """
-                batch_input_embeds, batch_attention_mask = reencode_fn(
-                    batch_generation_prompts,
-                    batch_all_images,
-                    i,
-                    end_idx,
-                )
-                batch_prompt_completion_ids = self.generate_text(
-                    prompt=None,
-                    inputs_embeds=batch_input_embeds,
-                    attention_mask=batch_attention_mask,
-                    position_ids=None,
-                    tokenizer=tokenizer,
-                    steps=steps,
-                    gen_length=gen_length,
-                    block_length=block_length,
-                    temperature=temperature,
-                    cfg_scale=cfg_scale,
-                    remasking=remasking,
-                    mask_id=mask_id,
-                    t2i_inference=False,
-                    do_sample=False,
-                    prefix_lm=True,
-                )
-                batch_prompt_mask = batch_attention_mask
-            elif gen_type == "grounding":
-                batch_prompt_completion_ids = batch_bbox_ids
-                batch_prompt_mask = batch_attention_mask
-            else:
-                batch_prompt_completion_ids = self.generate_text(
-                    prompt=None,
-                    inputs_embeds=batch_input_embeds,
-                    attention_mask=batch_attention_mask,
-                    position_ids=None,
-                    tokenizer=tokenizer,
-                    steps=steps,
-                    gen_length=gen_length,
-                    block_length=block_length,
-                    temperature=temperature,
-                    cfg_scale=cfg_scale,
-                    remasking=remasking,
-                    mask_id=mask_id,
-                    t2i_inference=False,
-                    do_sample=False,
-                    prefix_lm=True,
-                )
-                batch_prompt_mask = batch_attention_mask
-
-            prompt_completion_ids_all.append(batch_prompt_completion_ids)
-            prompt_masks_all.append(batch_prompt_mask)
-            del batch_prompt_completion_ids
-            torch.cuda.empty_cache()
-
-        completion_ids = torch.cat(prompt_completion_ids_all, dim=0)
-        max_prompt_len = max(m.shape[1] for m in prompt_masks_all)
-        padded_prompt_masks = []
-        for m in prompt_masks_all:
-            pad_len = max_prompt_len - m.shape[1]
-            if pad_len > 0:
-                pad_m = torch.zeros((m.shape[0], pad_len), dtype=m.dtype, device=m.device)
-                m = torch.cat([pad_m, m], dim=1)
-            padded_prompt_masks.append(m)
-        prompt_mask = torch.cat(padded_prompt_masks, dim=0)
-
-        result = {
-            "completion_ids": completion_ids,
-            "prompt_mask": prompt_mask,
-        }
-        if gen_type in {"grounding", "image_gen"}:
-            result["bbox_ids"] = torch.cat(bbox_ids_all, dim=0) if bbox_ids_all else None
-            result["pred_bboxes"] = pred_bboxes_all
-            if any(v is not None for v in bbox_texts_all):
-                result["bbox_texts"] = bbox_texts_all
-        if gen_type == "image_gen":
-            result["edited_images"] = edited_images_all
-            if return_debug:
-                result["image_gen_debug"] = image_gen_debug_all
-        return result
     
     def forward(
         self,
@@ -1093,7 +943,6 @@ class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
         unmask_order = None
         if confidence_policy == "stratified" and enable_stratified:
             try:
-                from pmj import stratified_random
 
                 _dim = int(np.sqrt(grid_tokens))
                 unmask_order = stratified_random(n=_dim, seed=42, shuffle_blocks=True)
@@ -1101,7 +950,7 @@ class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
                 confidence_policy = "mmada"
 
         x0 = xt.clone()
-        x0_history = []
+        xt_history = []
         active_steps = torch.nonzero(num_transfer_tokens.sum(dim=0) > 0, as_tuple=False).squeeze(-1)
         for step_idx, step_col in enumerate(
             tqdm(active_steps, desc=f"Region editing {batch_size} images"), start=1
@@ -1216,9 +1065,6 @@ class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
                     x0_p = x0_p.permute(0, 2, 1).max(dim=1)[0]
             else:
                 x0 = torch.where(mask_idx, x0, xt)
-            
-            x0_history.append(x0.clone().cpu())
-
             transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=device)
             for b in range(batch_size):
                 b_mask = mask_idx[b]
@@ -1255,15 +1101,23 @@ class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
                     transfer_index[b, select_index] = True
 
             xt[transfer_index] = x0[transfer_index]
+            if return_debug:
+                xt_history.append(xt.detach().cpu())
 
         xt = x0.clone()
         xt[xt == img_mask_id] = x0[xt == img_mask_id]
         decoded_images = self.decode_image_gen(xt, image_resolution, image_resolution)
         edited_images = [Image.fromarray(decoded_images[i]) for i in range(batch_size)]
         if return_debug:
-            for img in x0_history:
-                history_images = self.decode_image_gen(xt, image_resolution, image_resolution)
-                debug_images = [Image.fromarray(decoded_images[i]) for i in range(batch_size)]
+            step_images = [[] for _ in range(batch_size)]
+            for latent_step in xt_history:
+                decoded_step = self.decode_image_gen(
+                    latent_step.to(device=device),
+                    image_resolution,
+                    image_resolution,
+                )
+                for sample_idx in range(batch_size):
+                    step_images[sample_idx].append(Image.fromarray(decoded_step[sample_idx]))
             debug_payload = {
                 "debug_label": debug_label,
                 "mask_idx_2d_shape": [int(mask_idx_2d.shape[0]), int(mask_idx_2d.shape[1])],
@@ -1273,7 +1127,7 @@ class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
                 "is_unitok": bool(is_unitok),
                 "samples": debug_samples,
                 "n_steps": n_steps,
-                "x0_history": x0_history,
+                "step_images": step_images,
             }
             return edited_images, debug_payload
         return edited_images
@@ -1440,6 +1294,33 @@ class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
 
         return x
 
+    def generate_bbox(self, tokenizer, inputs_embeds, bbox_mask):
+        logits = get_logits(self.get_model(), inputs_embeds)
+        token_ids = logits.argmax(dim=-1)
+        eos_id = tokenizer.eos_token_id
+        row_ids_list = []
+        for row_idx in range(token_ids.size(0)):
+            row_ids = token_ids[row_idx][bbox_mask[row_idx]]
+            row_ids = row_ids[:4]
+            if row_ids.numel() < 4:
+                pad = torch.full(
+                    (4 - row_ids.numel(),),
+                    eos_id,
+                    dtype=torch.long,
+                    device=row_ids.device,
+                )
+                row_ids = torch.cat([row_ids, pad], dim=0)
+            row_ids_list.append(row_ids.to(torch.long))
+        bbox_ids = torch.stack(row_ids_list, dim=0)
+
+        decoded = tokenizer.batch_decode(
+            bbox_ids, skip_special_tokens=False
+        )
+        pred_bboxes = []
+        for decoded_bbox in decoded:
+            loc_vals = [int(v) for v in re.findall(r"<LOC_([0-9]+)>", decoded_bbox)]
+            pred_bboxes.append(loc_vals[:4] if len(loc_vals) >= 4 else [])
+        return bbox_ids, pred_bboxes, decoded
 
     @torch.no_grad()
     def generate(

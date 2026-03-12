@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --partition=sharedp
+#SBATCH --partition=dgm
 #SBATCH --account=dgm
 #SBATCH --job-name=lmmseval-text-vanilla
 #SBATCH --nodes=1
@@ -15,7 +15,8 @@ BATCH_SIZE=${BATCH_SIZE:-16}
 # CKPT="/group2/dgm/yoonjeon/ckpts/rl-lavidao-thinkmorph/thinkmorph-sft/checkpoint-250" # # CKPT="/group2/dgm/yoonjeon/LaViDa-O"
 # CKPT="/group2/dgm/yoonjeon/ckpts/sft-lavidao-thinkmorph/checkpoint-26000"
 # CKPT="/group2/dgm/yoonjeon/LaViDa-O"
-CKPT="/group2/dgm/yoonjeon/ckpts/sft-lavidao-thinkmorph-complete/checkpoint-1000"
+# CKPT="/group2/dgm/yoonjeon/ckpts/sft-lavidao-thinkmorph-complete/checkpoint-1000"
+CKPT="/group2/dgm/yoonjeon/ckpts/rl-lavidao-thinkmorph/thinkmorph_edit-sft/checkpoint-200"
 LIMIT=${LIMIT:-}
 NUM_GPUS=${NUM_GPUS:-4}
 TASKS="blink_jigsaw_cot_text_only,vstar_bench_cot_text_only,cv_bench_cot_text_only,VisualPuzzles_cot_text_only,chartqa_cot_text_only"
@@ -43,8 +44,7 @@ PRE_PROMPT=$'\nLet\'s think step-by-step to solve the question. \nPut your final
 LMMS_SPECIFIC_KWARGS="llava_llada:pre_prompt=${PRE_PROMPT},post_prompt="
 OUTPUT_DIR="outputs/eval_generate_logs/${CHAT_MODE}_tok${MAX_NEW_TOKENS}_blk${BLOCK_LENGTH}_step${STEP_PER_BLOCK}_t${TEMPERATURE}"
 if [ "${NUM_GPUS}" -eq 1 ]; then
-    LAUNCH_CMD="python"
-    LAUNCH_ARGS="-m lmms_eval"
+    LAUNCH_CMD=(".venv/bin/python" -m lmms_eval)
 else
     # Force local rendezvous on single-node Slurm jobs to avoid inheriting
     # stale cluster addresses (e.g. 10.0.0.1:29500) from the environment.
@@ -53,8 +53,15 @@ else
     unset RANK WORLD_SIZE LOCAL_RANK LOCAL_WORLD_SIZE NODE_RANK
     echo "MASTER_ADDR=${MASTER_ADDR} MASTER_PORT=${MASTER_PORT} NUM_GPUS=${NUM_GPUS}"
 
-    LAUNCH_CMD="accelerate launch --num_machines=1 --machine_rank=0 --main_process_ip=${MASTER_ADDR} --main_process_port=${MASTER_PORT} --num_processes=${NUM_GPUS}"
-    LAUNCH_ARGS="-m lmms_eval"
+    LAUNCH_CMD=(
+        .venv/bin/python -m accelerate.commands.launch
+        --num_machines=1
+        --machine_rank=0
+        --main_process_ip="${MASTER_ADDR}"
+        --main_process_port="${MASTER_PORT}"
+        --num_processes="${NUM_GPUS}"
+        -m lmms_eval
+    )
 fi
 
 echo "Running with TASKS=${TASKS} CKPT=${CKPT} BATCH_SIZE=${BATCH_SIZE} CHAT_MODE=${CHAT_MODE}"
@@ -64,7 +71,7 @@ if [[ -n "${LIMIT}" && "${LIMIT,,}" != "none" ]]; then
     LIMIT_ARGS=(--limit "${LIMIT}")
 fi
 
-${LAUNCH_CMD} ${LAUNCH_ARGS} \
+"${LAUNCH_CMD[@]}" \
     --model llava_llada \
     --model_args pretrained=$CKPT,conv_template=llada,model_name=llava_llada${CHAT_MODE:+,chat_mode=${CHAT_MODE}},img_gen_save_dir=${OUTPUT_DIR}/gen_imgs,img_gen_conf_policy=stratified,img_gen_edit_mode=0,img_gen_guidance_scale=1.2,img_gen_guidance_scale_image=1.4,img_gen_n_steps=64,img_gen_temperature=0.8,img_gen_enable_stratified=True \
     --tasks "$TASKS" \

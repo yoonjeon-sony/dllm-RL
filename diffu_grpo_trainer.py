@@ -43,164 +43,13 @@ from llava.mm_utils import process_images, tokenizer_image_token, pad_to_square_
 from llava.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
 from llava.conversation import conv_templates
 from llava.model.language_model.llada.generate import add_gumbel_noise, get_num_transfer_tokens, cosine_schedule_2, logit_normal_schedule, exp_schedule, wte, get_logits, get_num_transfer_tokens_sch
+from interleaved_inferencer import InterleavedInferencer
 logger = logging.getLogger(__name__)
 
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
 
-try:
-    from lmms_eval.tasks import TaskManager, get_task_dict
-    _lmms_task_manager = TaskManager()
-    _LMMS_EVAL_AVAILABLE = True
-except Exception:
-    _LMMS_EVAL_AVAILABLE = False
-
-EVAL_CONV_TEMPLATE = os.environ.get("EVAL_CONV_TEMPLATE", "llada")
-
-# What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
-# rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
-
-
-class GrpoLMMsEvalDataset(TorchDataset):
-    """
-    Reads a pre-cached parquet file (from prepare_eval_datasets.py) and turns each
-    row into a tokenized prompt ready for diffusion generation.
-
-    Each item:
-      input_ids    : 1-D LongTensor (not batched yet)
-      modalities   : list[str]
-      images       : list[Tensor] or empty list
-      image_sizes  : list[tuple]
-      index        : int (row_idx in parquet, 0-based)
-      doc_index    : int (same as index — used by _process_results_grpo)
-      prompt       : str
-    """
-
-    def __init__(
-        self,
-        parquet_path: str,
-        task_obj,
-        model_config,
-        image_processor,
-        conv_template: str,
-        tokenizer,
-        image_col_names: list,
-    ):
-        super().__init__()
-        self.df = pd.read_parquet(parquet_path)
-        self.task_obj = task_obj
-        self.model_config = model_config
-        self.image_processor = image_processor
-        self.conv_template = conv_template
-        self.tokenizer = tokenizer
-        self.image_col_names = image_col_names
-
-    # ------------------------------------------------------------------
-    def _row_to_doc(self, row: dict) -> dict:
-        """Reconstruct a lmms-eval doc dict from a parquet row."""
-        doc = {}
-        for k, v in row.items():
-            if k.endswith("_bytes"):
-                col = k[: -len("_bytes")]
-                if v is None or (isinstance(v, float) and np.isnan(v)):
-                    doc[col] = None
-                else:
-                    doc[col] = Image.open(io.BytesIO(bytes(v)))
-            else:
-                doc[k] = v
-        return doc
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, index):
-        row = self.df.iloc[index].to_dict()
-        doc = self._row_to_doc(row)
-
-        # Get visuals and text using lmms-eval task methods
-        visual = self.task_obj.doc_to_visual(doc)
-        context = self.task_obj.doc_to_text(doc)
-
-        if visual is None or visual == []:
-            visual = []
-            task_type = "text"
-            image_tensor = None
-            image_sizes = []
-        else:
-            visual = [v for v in visual if v is not None and isinstance(v, PIL.Image.Image)]
-            if len(visual) == 0:
-                task_type = "text"
-                image_tensor = None
-                image_sizes = []
-            else:
-                image_tensor = process_images(visual, self.image_processor, self.model_config)
-                if not isinstance(image_tensor, list):
-                    image_tensor = [image_tensor]
-                task_type = "image"
-                image_sizes = [v.size for v in visual]
-
-        if image_tensor is not None and len(image_tensor) > 0 and DEFAULT_IMAGE_TOKEN not in context:
-            placeholder_count = len(visual)
-            image_tokens = " ".join([DEFAULT_IMAGE_TOKEN] * placeholder_count)
-            prompts_input = image_tokens + "\n" + context
-        else:
-            prompts_input = context
-
-        if "llama_3" in self.conv_template or "llada" in self.conv_template:
-            conv = copy.deepcopy(conv_templates[self.conv_template])
-        else:
-            conv = conv_templates[self.conv_template].copy()
-
-        conv.append_message(conv.roles[0], prompts_input)
-        conv.append_message(conv.roles[1], None)
-        prompt = conv.get_prompt()
-
-        input_ids = tokenizer_image_token(prompt, self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt")
-
-        return {
-            "input_ids": input_ids,
-            "modalities": ["image"] if task_type == "image" else ["text"],
-            "images": image_tensor if image_tensor is not None else [],
-            "image_sizes": image_sizes,
-            "index": index,
-            "doc_index": int(row["row_idx"]),
-            "prompt": prompt,
-        }
-
-
-@dataclass
-class GrpoDataCollatorForEval:
-    """Left-pad input_ids to uniform length; pass other fields through unchanged."""
-
-    tokenizer: PreTrainedTokenizerBase
-
-    def _pad_sequence(self, input_ids_list):
-        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-        if self.tokenizer.padding_side == "left":
-            input_ids_list = [torch.flip(x, [0]) for x in input_ids_list]
-        padded = torch.nn.utils.rnn.pad_sequence(input_ids_list, batch_first=True, padding_value=pad_id)
-        if self.tokenizer.padding_side == "left":
-            padded = torch.flip(padded, [1])
-        return padded
-
-    def __call__(self, instances: Sequence[Dict]) -> Dict[str, Any]:
-        input_ids = [inst["input_ids"] for inst in instances]
-        input_ids = self._pad_sequence(input_ids)
-        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-        attention_mask = input_ids.ne(pad_id)
-
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "modalities": [inst["modalities"] for inst in instances],
-            "images": [inst["images"] for inst in instances],
-            "image_sizes": [inst["image_sizes"] for inst in instances],
-            "index": [inst["index"] for inst in instances],
-            "doc_index": torch.tensor([inst["doc_index"] for inst in instances], dtype=torch.long),
-            "prompt": [inst["prompt"] for inst in instances],
-        }
-
 
 class DiffuGRPOTrainer(GRPOTrainer):
     """
@@ -215,15 +64,6 @@ class DiffuGRPOTrainer(GRPOTrainer):
     - Efficient computation of per-token log probabilities for diffusion models
     - Specialized generation process for diffusion models with iterative denoising
     """
-
-    # Image column names per lmms-eval task (used by _TASK_IMAGE_COL_NAMES)
-    _TASK_IMAGE_COL_NAMES = {
-        "chartqa": ["image"],
-        "blink_jigsaw": ["image_1", "image_2", "image_3", "image_4"],
-        "cv_bench": ["image"],
-        "vstar_bench": ["image"],
-        "VisualPuzzles_direct": ["image"],
-    }
 
     def __init__(
         self,
@@ -243,6 +83,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
             None,
             None,
         ),
+        model_init_fn = None,
         peft_config: Optional["PeftConfig"] = None,
     ):
         super().__init__(
@@ -261,23 +102,8 @@ class DiffuGRPOTrainer(GRPOTrainer):
         self.max_prompt_length = args.max_prompt_length if args is not None else None
         # Override parent's None; use a dict so item assignment never fails due to list pre-allocation.
         self._buffered_inputs = {}
-        # lmms-eval mid-training evaluation state (lazily initialised on first evaluate())
-        self._eval_task_dict = {}
-        self._eval_df_dict = {}
-        self._eval_initialized = False
-        self._eval_model_config = None
-        self._eval_image_processor = None
-
-    def _move_cached_tensors(self, value, device: Union[str, torch.device]):
-        if torch.is_tensor(value):
-            return value.detach().to(device=device, non_blocking=(str(device) != "cpu"))
-        if isinstance(value, dict):
-            return {k: self._move_cached_tensors(v, device) for k, v in value.items()}
-        if isinstance(value, list):
-            return [self._move_cached_tensors(v, device) for v in value]
-        if isinstance(value, tuple):
-            return tuple(self._move_cached_tensors(v, device) for v in value)
-        return value
+        self.model_init_fn = model_init_fn
+        self.inferencer = InterleavedInferencer(self.model)
 
     def _save_checkpoint(self, model, trial):
         original_pc = self.processing_class
@@ -315,13 +141,9 @@ class DiffuGRPOTrainer(GRPOTrainer):
             model = self.model
 
         logger.info(f"Loading model checkpoint from {resume_from_checkpoint}")
-        _, loaded_model, _, _ = load_pretrained_model(
+        _, loaded_model, _, _ = self.model_init_fn(
             resume_from_checkpoint,
-            None,
-            "llava_llada",
-            attn_implementation="sdpa",
-            device_map="cpu",
-            torch_dtype="bfloat16",
+            self.config.add_vision_tokens
         )
         loaded_model.to(torch.bfloat16)
 
@@ -334,283 +156,12 @@ class DiffuGRPOTrainer(GRPOTrainer):
         if load_result.unexpected_keys:
             logger.warning(f"Checkpoint load — unexpected keys: {load_result.unexpected_keys}")
 
+        # Keep inferencer bound to the trainer model after checkpoint restore.
+        self.inferencer.model = self.model
+
         del loaded_model
         torch.cuda.empty_cache()
         logger.info(f"Successfully loaded checkpoint from {resume_from_checkpoint}")
-
-    # ------------------------------------------------------------------
-    # Mid-training lmms-eval evaluation
-    # ------------------------------------------------------------------
-
-    def _init_eval_infrastructure(self):
-        """Lazily initialise lmms-eval tasks and parquet DataFrames on first evaluate() call."""
-        if self._eval_initialized:
-            return
-
-        args = self.args
-        eval_tasks_str = getattr(args, "eval_tasks", None)
-        eval_parquet_dir = getattr(args, "eval_parquet_dir", None)
-
-        if not _LMMS_EVAL_AVAILABLE:
-            logger.warning("lmms_eval not available — skipping mid-training eval.")
-            self._eval_initialized = True
-            return
-
-        if not eval_tasks_str or not eval_parquet_dir:
-            logger.info("eval_tasks or eval_parquet_dir not set — skipping mid-training eval.")
-            self._eval_initialized = True
-            return
-
-        task_names = [t.strip() for t in eval_tasks_str.split(",") if t.strip()]
-        try:
-            self._eval_task_dict = get_task_dict(task_names, _lmms_task_manager)
-        except Exception as e:
-            logger.warning(f"Failed to load lmms-eval task dict: {e}")
-            self._eval_initialized = True
-            return
-
-        for task_name in task_names:
-            parquet_path = os.path.join(eval_parquet_dir, f"{task_name}_n100_seed42.parquet")
-            if not os.path.exists(parquet_path):
-                logger.warning(f"Eval parquet not found: {parquet_path} — skipping {task_name}.")
-                continue
-            try:
-                self._eval_df_dict[task_name] = pd.read_parquet(parquet_path)
-            except Exception as e:
-                logger.warning(f"Failed to read parquet for {task_name}: {e}")
-
-        # Grab model config and image processor
-        try:
-            unwrapped = self.accelerator.unwrap_model(self.model)
-            self._eval_model_config = unwrapped.config
-            self._eval_image_processor = unwrapped.get_vision_tower().image_processor
-        except Exception as e:
-            logger.warning(f"Could not get model config / image processor for eval: {e}")
-
-        self._eval_initialized = True
-
-    def evaluate(
-        self,
-        eval_dataset=None,
-        ignore_keys=None,
-        metric_key_prefix: str = "eval",
-    ):
-        """
-        Complete override of Trainer.evaluate().  Runs lmms-eval benchmarks on
-        pre-cached parquet splits and logs results to W&B.
-        We do NOT call super().evaluate() because no eval_dataset is passed to
-        the trainer (it would raise ValueError).
-        """
-        self._init_eval_infrastructure()
-
-        if not self._eval_task_dict:
-            return {}
-
-        self.model.eval()
-        log_dict = {}
-
-        try:
-            tokenizer = self.processing_class.tokenizer
-            collator = GrpoDataCollatorForEval(tokenizer)
-            args = self.args
-
-            for task_name, task_obj in self._eval_task_dict.items():
-                if task_name not in self._eval_df_dict:
-                    continue
-
-                parquet_path = os.path.join(
-                    args.eval_parquet_dir, f"{task_name}_n100_seed42.parquet"
-                )
-                image_col_names = self._TASK_IMAGE_COL_NAMES.get(task_name, ["image"])
-
-                eval_ds = GrpoLMMsEvalDataset(
-                    parquet_path=parquet_path,
-                    task_obj=task_obj,
-                    model_config=self._eval_model_config,
-                    image_processor=self._eval_image_processor,
-                    conv_template=EVAL_CONV_TEMPLATE,
-                    tokenizer=tokenizer,
-                    image_col_names=image_col_names,
-                )
-
-                dataloader = self.accelerator.prepare_data_loader(
-                    DataLoader(eval_ds, batch_size=1, collate_fn=collator, shuffle=False)
-                )
-
-                logger.info(
-                    f"[eval] Starting {task_name} ({len(eval_ds)} samples, "
-                    f"step={self.state.global_step})"
-                )
-                resps, doc_indices = self.generate_until_loop_grpo(
-                    dataloader, task_name, task_obj
-                )
-
-                processed = self._process_results_grpo(resps, doc_indices, task_name, task_obj)
-
-                # Gather results from all ranks
-                world_size = self.accelerator.num_processes
-                all_processed = [None] * world_size
-                dist.all_gather_object(all_processed, processed)
-
-                merged = collections.defaultdict(list)
-                for rank_result in all_processed:
-                    for metric, data in rank_result.items():
-                        merged[metric].extend(data)
-
-                agg_fns = task_obj.aggregation()
-
-                if self.accelerator.is_main_process:
-                    for metric, data in merged.items():
-                        # Skip metrics not in metric_list and the "submission" sentinel
-                        if metric not in agg_fns or metric == "submission":
-                            continue
-                        try:
-                            score = agg_fns[metric](data)
-                            log_dict[f"eval/{task_name}/{metric}"] = score
-                            logger.info(f"[eval] {task_name}/{metric} = {score:.4f}")
-                        except Exception as e:
-                            logger.warning(f"[eval] aggregation failed for {task_name}/{metric}: {e}")
-
-                self.accelerator.wait_for_everyone()
-                torch.cuda.empty_cache()
-
-            if log_dict and self.accelerator.is_main_process:
-                if wandb.run is not None:
-                    wandb.log({**log_dict, "train/global_step": self.state.global_step})
-
-        finally:
-            self.model.train()
-
-        return log_dict
-
-    def generate_until_loop_grpo(self, dataloader, task_name: str, task_obj):
-        """
-        Run diffusion generation over the eval dataloader.
-        Returns (resps, doc_indices) — lists local to this rank.
-        """
-        args = self.args
-        device = self.accelerator.device
-        tokenizer = self.processing_class.tokenizer
-
-        # Determine generation length
-        task_gkwargs = task_obj.config.generation_kwargs or {}
-        task_max_tokens = task_gkwargs.get("max_new_tokens", 16)
-        cap = getattr(args, "eval_max_new_tokens_override", 64)
-        gen_length = min(task_max_tokens, cap) if cap is not None else task_max_tokens
-
-        block_length = min(getattr(args, "block_length", 64), gen_length)
-        if block_length == 0:
-            block_length = gen_length
-        # Ensure gen_length is a multiple of block_length
-        gen_length = math.ceil(gen_length / block_length) * block_length
-        steps = gen_length  # same convention as training rollout
-
-        resps = []
-        doc_indices = []
-
-        pbar = tqdm(
-            total=len(dataloader),
-            desc=task_name,
-            disable=not self.accelerator.is_local_main_process,
-        )
-
-        with torch.inference_mode():
-            with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
-                inner_model = unwrapped_model.get_model()
-
-                for batch in dataloader:
-                    modalities = batch.pop("modalities")[0]
-                    image_sizes = batch.pop("image_sizes")[0]
-                    images = batch["images"][0]
-                    input_ids = batch["input_ids"]
-                    doc_idx = batch["doc_index"][0].item()
-
-                    # Build prompt embeddings (vision-aware)
-                    if images is not None and len(images) > 0:
-                        images_dev = [img.to(dtype=torch.bfloat16, device=device) for img in images]
-                        (_, _, attn_mask, _, inputs_embeds, _) = (
-                            unwrapped_model.prepare_inputs_labels_for_multimodal(
-                                input_ids,
-                                None,
-                                batch["attention_mask"],
-                                None,
-                                None,
-                                images_dev,
-                                modalities,
-                                image_sizes=image_sizes,
-                            )
-                        )
-                    else:
-                        inputs_embeds = unwrapped_model.get_model().embed_tokens(
-                            input_ids.to(device)
-                        )
-                        attn_mask = batch["attention_mask"]
-
-                    # Truncate prompt to max_prompt_length if needed
-                    if args.max_prompt_length is not None:
-                        inputs_embeds = inputs_embeds[:, -args.max_prompt_length:]
-                        attn_mask = attn_mask[:, -args.max_prompt_length:]
-
-                    # Diffusion generation
-                    completion_ids = self.generate(
-                        model=inner_model,
-                        prompt=None,
-                        inputs_embeds=inputs_embeds,
-                        attention_mask=attn_mask,
-                        position_ids=None,
-                        tokenizer=tokenizer,
-                        steps=steps,
-                        gen_length=gen_length,
-                        block_length=block_length,
-                        temperature=0.0,
-                        cfg_scale=0.0,
-                        remasking=args.remasking,
-                        mask_id=args.mask_id,
-                        t2i_inference=False,
-                        do_sample=False,
-                        prefix_lm=True,
-                    )
-
-                    text = tokenizer.decode(
-                        completion_ids[0], skip_special_tokens=True
-                    ).strip()
-                    resps.append(text)
-                    doc_indices.append(doc_idx)
-                    pbar.update(1)
-
-        pbar.close()
-        return resps, doc_indices
-
-    def _process_results_grpo(
-        self,
-        resps,
-        doc_indices,
-        task_name: str,
-        task_obj,
-    ):
-        """
-        Run task_obj.process_results() for each (resp, doc_idx) pair.
-        Returns a dict {metric_name: [result, ...]} local to this rank.
-        """
-        df = self._eval_df_dict[task_name]
-        processed_results = collections.defaultdict(list)
-
-        for resp, doc_idx in zip(resps, doc_indices):
-            rows = df[df["row_idx"] == doc_idx]
-            if len(rows) == 0:
-                logger.warning(f"[eval] row_idx={doc_idx} not found in {task_name} parquet")
-                continue
-            row = rows.iloc[0].to_dict()
-            # Reconstruct meta doc (strip _bytes columns, no image decoding needed for process_results)
-            meta_doc = {k: v for k, v in row.items() if not k.endswith("_bytes")}
-            try:
-                result = task_obj.process_results(meta_doc, [resp])
-                for metric, data in result.items():
-                    processed_results[metric].append(data)
-            except Exception as e:
-                logger.warning(f"[eval] process_results failed for {task_name} doc {doc_idx}: {e}")
-
-        return processed_results
 
     def training_step(self, model, inputs, num_items_in_batch):
         time_before = time.perf_counter()
@@ -893,17 +444,23 @@ class DiffuGRPOTrainer(GRPOTrainer):
         self, inputs: dict[str, Union[torch.Tensor, Any]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
         mode = "eval" if self.control.should_evaluate else "train"
+        return_debug_artifacts = bool(getattr(self.args, "return_debug_artifacts", False))
         if mode == "train":
-            buf_key = self._step % self.args.gradient_accumulation_steps
-            if self.state.global_step % self.num_iterations == 0 or buf_key not in self._buffered_inputs:
-                inputs = self._generate_and_score_completions(inputs)
-                self._buffered_inputs[buf_key] = self._move_cached_tensors(inputs, "cpu")
+            if self.state.global_step % self.num_iterations == 0:
+                inputs = self._generate_and_score_completions(
+                    inputs,
+                    return_debug_artifacts=return_debug_artifacts,
+                )
+                self._buffered_inputs[self._step % self.args.gradient_accumulation_steps] = inputs
             else:
-                inputs = self._move_cached_tensors(self._buffered_inputs[buf_key], self.accelerator.device)
+                inputs = self._buffered_inputs[self._step % self.args.gradient_accumulation_steps]
             self._step += 1
         else:
             # In evaluation, we don't reuse completions across multiple updates, so we don't need to buffer inputs.
-            inputs = self._generate_and_score_completions(inputs)
+            inputs = self._generate_and_score_completions(
+                inputs,
+                return_debug_artifacts=return_debug_artifacts,
+            )
         return inputs
 
     def _generate_and_score_completions(
@@ -913,128 +470,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
     ) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
 
-        def _get_reward_func_name(reward_func):
-            if isinstance(
-                reward_func, nn.Module
-            ):  # Module instead of PretrainedModel for compat with compiled models
-                return reward_func.config._name_or_path.split("/")[-1]
-            return reward_func.__name__
-
-        def _build_reward_completions(prompts_for_reward, completion_texts):
-            if is_conversational(inputs[0]):
-                completions_for_reward = []
-                for prompt, completion in zip(prompts_for_reward, completion_texts):
-                    completion = "" if completion is None else completion
-                    bootstrap = (
-                        prompt[-1]["content"]
-                        if prompt and isinstance(prompt, list) and prompt[-1]["role"] == "assistant"
-                        else ""
-                    )
-                    completions_for_reward.append(
-                        [{"role": "assistant", "content": bootstrap + completion}]
-                    )
-                return completions_for_reward
-            return completion_texts
-
-        def _format_image_gen_prompt_log(grounding_prompt, answer_prompt):
-            grounding_prompt = "" if grounding_prompt is None else grounding_prompt
-            answer_prompt = "" if answer_prompt is None else answer_prompt
-            return (
-                "[Grounding input]\n"
-                f"{grounding_prompt}\n\n"
-                "[Text input]\n"
-                f"{answer_prompt}"
-            )
-
-        def _format_image_gen_completion_log(grounding_completion, answer_completion):
-            grounding_completion = "" if grounding_completion is None else grounding_completion
-            answer_completion = "" if answer_completion is None else answer_completion
-            return (
-                "[Grounding output]\n"
-                f"{grounding_completion}\n\n"
-                "[Text output]\n"
-                f"{answer_completion}"
-            )
-
-        def _sample_log_indices(num_rows, sample_ratio, step_seed):
-            if num_rows <= 0:
-                return []
-            sample_ratio = max(0.0, min(1.0, float(sample_ratio)))
-            if sample_ratio <= 0.0:
-                return []
-            sample_size = max(1, int(math.ceil(num_rows * sample_ratio)))
-            sample_size = min(num_rows, sample_size)
-            rng = random.Random(step_seed)
-            return sorted(rng.sample(range(num_rows), sample_size))
-
-        def _select_by_indices(values, indices):
-            return [values[idx] for idx in indices]
-
-        def _log_prompt_completion_samples_rich(
-            prompts_to_print,
-            completions_to_print,
-            rewards_to_print,
-            advantages_to_print,
-            step,
-        ):
-            if not prompts_to_print or not is_rich_available():
-                return
-            from rich.rule import Rule
-            from rich.panel import Panel
-            from rich.text import Text
-            from rich.console import Console
-
-            console = Console()
-
-            console.print(Rule(f"[bold magenta]GRPO Samples @ step {step}[/bold magenta]"))
-
-            for row_idx, (prompt, completion, advantage) in enumerate(
-                zip(prompts_to_print, completions_to_print, advantages_to_print), start=1
-            ):
-                prompt_text = "" if prompt is None else str(prompt)
-                completion_text = "" if completion is None else str(completion)
-
-                # Prompt block
-                console.print(
-                    Panel(
-                        prompt_text,
-                        title=f"[bold cyan]Prompt • Sample {row_idx}[/bold cyan]",
-                        border_style="cyan",
-                        padding=(1, 2),
-                    )
-                )
-
-                # Completion block
-                console.print(
-                    Panel(
-                        completion_text,
-                        title="[bold green]Completion[/bold green]",
-                        border_style="green",
-                        padding=(1, 2),
-                    )
-                )
-
-                # Rewards block
-                reward_lines = []
-                for reward_name, reward_values in rewards_to_print.items():
-                    reward_value = (
-                        reward_values[row_idx - 1] if row_idx - 1 < len(reward_values) else None
-                    )
-                    reward_lines.append(f"[yellow]{reward_name}[/yellow]: {reward_value}")
-
-                reward_lines.append(f"[bold bright_green]advantage[/bold bright_green]: {advantage}")
-
-                console.print(
-                    Panel(
-                        "\n".join(reward_lines),
-                        title="[bold yellow]Rewards[/bold yellow]",
-                        border_style="yellow",
-                        padding=(1, 2),
-                    )
-                )
-
-                if row_idx != len(prompts_to_print):
-                    console.print(Rule(style="dim"))
+        
 
         prompts_text = [x["prompt"] for x in inputs]
         grounding_prompts = [x.get("grounding_prompt", x["prompt"]) for x in inputs]
@@ -1055,6 +491,9 @@ class DiffuGRPOTrainer(GRPOTrainer):
         assert gen_type in ["text_gen", "image_gen", "grounding"], f"Invalid generation type: {gen_type}"
 
         if gen_type == "image_gen":
+            grounding_batch = self.processing_class.prepare_text_with_images(grounding_prompts, images, include_bbox_mask=True)
+            prompt_batch = self.processing_class.prepare_text_with_images(prompts_text, images, include_bbox_mask=False)
+
             batch_inputs = self.processing_class(
                 texts=prompts_text,
                 grounding_texts=grounding_prompts,
@@ -1067,7 +506,6 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 add_special_tokens=False,
                 device=device,
                 dtype=torch.bfloat16,
-                mask_id=self.args.mask_id,
                 mode="image_gen",
                 do_cfg= self.args.guidance_scale > 0 ,
             )
@@ -1082,7 +520,6 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 add_special_tokens=False,
                 device=device,
                 dtype=torch.bfloat16,
-                mask_id=self.args.mask_id,
                 mode="grounding",
             )
         else:
@@ -1095,7 +532,6 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 add_special_tokens=False,
                 device=device,
                 dtype=torch.bfloat16,
-                mask_id=self.args.mask_id,
                 mode="text_gen",
             )
 
@@ -1124,6 +560,8 @@ class DiffuGRPOTrainer(GRPOTrainer):
             )
         _t_gen = time.perf_counter()
         with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
+            # Generation should run on the currently unwrapped model instance.
+            self.inferencer.model = unwrapped_model
             generation_batch_size = self.args.generation_batch_size
             init_images = None
             image_sizes = None
@@ -1143,37 +581,6 @@ class DiffuGRPOTrainer(GRPOTrainer):
                         sample_image = pad_to_square_and_resize(sample_image, target_resolution)
                     init_images.append(sample_image)
                 image_sizes = [(target_resolution, target_resolution)] * len(init_images)
-
-            def _bbox_postprocess_fn(bbox_ids, _batch_indices):
-                decoded = self.processing_class.tokenizer.batch_decode(
-                    bbox_ids, skip_special_tokens=False
-                )
-                pred_bboxes = []
-                for decoded_bbox in decoded:
-                    loc_vals = [int(v) for v in re.findall(r"<LOC_([0-9]+)>", decoded_bbox)]
-                    pred_bboxes.append(loc_vals[:4] if len(loc_vals) >= 4 else [])
-                return pred_bboxes, decoded
-
-            # TODO: Re-encode -> Use the latent output embedding during generate_image()
-            def _reencode_fn(batch_generation_prompts, batch_image_groups, _batch_start, _batch_end): 
-                re_batch_inputs = self.processing_class(
-                    texts=batch_generation_prompts,
-                    images=batch_image_groups,
-                    return_tensors="pt",
-                    padding=True,
-                    padding_side="left",
-                    add_special_tokens=False,
-                    device=device,
-                    dtype=torch.bfloat16,
-                    mask_id=self.args.mask_id,
-                    mode="text_gen",
-                )
-                batch_input_embeds = re_batch_inputs["input_embeds"]
-                batch_attention_mask = re_batch_inputs["attention_mask"]
-                if self.args.max_prompt_length is not None:
-                    batch_input_embeds = batch_input_embeds[:, -self.args.max_prompt_length :]
-                    batch_attention_mask = batch_attention_mask[:, -self.args.max_prompt_length :]
-                return batch_input_embeds, batch_attention_mask
 
             image_gen_kwargs = None
             if gen_type == "image_gen":
@@ -1199,7 +606,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
                         f"step_{self.state.global_step}_batch_0_{input_embeds.size(0)}"
                     )
 
-            gen_result = unwrapped_model._generate_mode(
+            gen_result = self.inferencer._generate_mode(
                 gen_type=gen_type,
                 tokenizer=self.processing_class.tokenizer,
                 input_embeds=input_embeds,
@@ -1226,10 +633,11 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 remasking=self.args.remasking,
                 mask_id=self.args.mask_id,
                 generation_batch_size=generation_batch_size,
-                bbox_postprocess_fn=_bbox_postprocess_fn if gen_type in {"grounding", "image_gen"} else None,
-                reencode_fn=_reencode_fn if gen_type == "image_gen" else None,
                 image_gen_kwargs=image_gen_kwargs,
                 return_debug=return_debug_artifacts and gen_type == "image_gen",
+                processing_class=self.processing_class,
+                max_prompt_length=self.max_prompt_length,
+                device=device,
             )
             completion_ids = gen_result["completion_ids"]
             prompt_mask = gen_result["prompt_mask"]
@@ -1247,6 +655,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 edited_images_all = gen_result.get("edited_images", edited_images_all)
                 if return_debug_artifacts:
                     image_gen_debug_all = gen_result.get("image_gen_debug", image_gen_debug_all)
+        self.inferencer.model = self.model
         if self.accelerator.is_main_process:
             logger.info(
                 f"[Step {self.state.global_step}] Generate  | done  | {time.perf_counter() - _t_gen:.1f}s"
@@ -1460,11 +869,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
             original_images_to_log = gather_object(original_images_all)
             edited_images_to_log = gather_object(edited_images_all)
 
-            def _align_len(values, target_len, pad_value=None):
-                values = list(values)
-                if len(values) < target_len:
-                    values.extend([pad_value] * (target_len - len(values)))
-                return values[:target_len]
+            
 
             if self.accelerator.is_main_process:
                 num_rows = len(rewards_to_log)

@@ -66,6 +66,7 @@ from mm_utils import (
 )
 from llava.model.builder import load_pretrained_model
 from llava.model.utils import pad_along_last_dim
+from interleaved_inferencer import InterleavedInferencer
 
 
 # Determine best attention implementation
@@ -244,6 +245,7 @@ class Llava_Llada(lmms):
             self._rank = 0
             self._world_size = 1
         #self.model.model.transformer = accelerate.cpu_offload(self.model.model.transformer)
+        self.inferencer = InterleavedInferencer(self.model)
 
     @property
     def gen_img_dir(self):
@@ -942,7 +944,7 @@ class Llava_Llada(lmms):
                 _, text_attn, text_embeds = _prepare_text_batch(
                     list(batched_contexts), batch_pil_images, append_image_tokens=True
                 )
-                gen_result = self.model._generate_mode(
+                gen_result = self.inferencer._generate_mode(
                     gen_type="text_gen",
                     tokenizer=self.tokenizer,
                     input_embeds=text_embeds,
@@ -1013,7 +1015,7 @@ class Llava_Llada(lmms):
                     )
                     return final_embeds, final_attn
 
-                gen_result = self.model._generate_mode(
+                gen_result = self.inferencer._generate_mode(
                     gen_type="image_gen",
                     tokenizer=self.tokenizer,
                     input_embeds=grd_embeds,
