@@ -2,7 +2,7 @@ import random
 import re
 
 MULTI_CHOICE_DIRECT_PROMPT = "Answer the question with the option's letter from the given choices directly."
-COT_PROMPT = "Solve the multiple-choice question and then answer with the option letter from the given choices. The last line of your response should be of the following format: 'Answer: $LETTER' (without quotes) where LETTER is one of options. Think step by step before answering."
+COT_PROMPT = "Solve the multiple-choice question and then answer with the option letter from the given choices."
 LLAVA_LLADA_COT_PROMPT = "Let's think step by step to answer the question. For text-based thinking, enclose the process within <think> </think>, e.g. <think> thinking process here </think>. For visual thinking, enclose the content within <image_start> </image_start>, e.g. <image_start> thinking image here </image_start>. Finally conclude with the final answer wrapped in <answer></answer> tags, i.e.<answer> answer here </answer>."
 PROMPTS = {"MULTI_CHOICE_DIRECT_PROMPT": MULTI_CHOICE_DIRECT_PROMPT, "COT_PROMPT": COT_PROMPT, "LLAVA_LLADA_COT_PROMPT": LLAVA_LLADA_COT_PROMPT}
 

@@ -16,18 +16,28 @@ import warnings
 import torch.nn.functional as F
 from trl.trainer.grpo_config import GRPOConfig
 from trl.extras.profiling import profiling_decorator, profiling_context
-from transformers.utils import is_peft_available
 from torch import nn
-from transformers.utils import is_rich_available
-from accelerate.utils import broadcast_object_list, gather, gather_object, is_peft_model, set_seed
-from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
-from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
-from trl.trainer.utils import (
-    generate_model_card,
-    get_comet_experiment_url,
-    pad,
-    selective_log_softmax,
-)
+from transformers.utils import is_accelerate_available
+if is_accelerate_available():
+    from accelerate import Accelerator, skip_first_batches
+    from accelerate.state import AcceleratorState
+    from accelerate.utils import (
+        set_seed,
+        gather,
+        gather_object,
+        DataLoaderConfiguration,
+        DistributedDataParallelKwargs,
+        DistributedType,
+        GradientAccumulationPlugin,
+        load_fsdp_model,
+        load_fsdp_optimizer,
+        release_memory,
+        save_fsdp_model,
+        save_fsdp_optimizer,
+    )
+
+from trl.models import unwrap_model_for_generation
+from trl.trainer.utils import pad
 import wandb
 import os
 import logging
@@ -43,11 +53,18 @@ from llava.mm_utils import process_images, tokenizer_image_token, pad_to_square_
 from llava.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
 from llava.conversation import conv_templates
 from llava.model.language_model.llada.generate import add_gumbel_noise, get_num_transfer_tokens, cosine_schedule_2, logit_normal_schedule, exp_schedule, wte, get_logits, get_num_transfer_tokens_sch
+from log_utils import (
+    _align_len,
+    _build_reward_completions,
+    _format_image_gen_completion_log,
+    _format_image_gen_prompt_log,
+    _get_reward_func_name,
+    _log_prompt_completion_samples_rich,
+    _sample_log_indices,
+    _select_by_indices,
+)
 from interleaved_inferencer import InterleavedInferencer
 logger = logging.getLogger(__name__)
-
-if is_peft_available():
-    from peft import PeftConfig, get_peft_model
 
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 
@@ -104,6 +121,39 @@ class DiffuGRPOTrainer(GRPOTrainer):
         self._buffered_inputs = {}
         self.model_init_fn = model_init_fn
         self.inferencer = InterleavedInferencer(self.model)
+        self._current_train_step_time = 0.0
+
+    def _slice_batch(self, batch: dict[str, Union[torch.Tensor, Any]], start: int, end: int):
+        batch_size = batch["prompt_ids"].size(0)
+        sliced = {}
+        for key, value in batch.items():
+            if torch.is_tensor(value) and value.dim() >= 1 and value.size(0) == batch_size:
+                sliced[key] = value[start:end]
+            elif torch.is_tensor(value) and value.dim() >= 2 and value.size(1) == batch_size:
+                sliced[key] = value[:, start:end]
+            elif isinstance(value, list) and len(value) == batch_size:
+                sliced[key] = value[start:end]
+            else:
+                sliced[key] = value
+        return sliced
+
+    def _split_generation_batch(self, batch: dict[str, Union[torch.Tensor, Any]]):
+        steps_per_generation = int(getattr(self.args, "steps_per_generation", 1) or 1)
+        batch_size = batch["prompt_ids"].size(0)
+
+        if steps_per_generation <= 1:
+            return [batch]
+        if batch_size % steps_per_generation != 0:
+            raise ValueError(
+                f"Generated batch size ({batch_size}) must be divisible by steps_per_generation "
+                f"({steps_per_generation})."
+            )
+
+        chunk_size = batch_size // steps_per_generation
+        return [
+            self._slice_batch(batch, start, start + chunk_size)
+            for start in range(0, batch_size, chunk_size)
+        ]
 
     def _save_checkpoint(self, model, trial):
         original_pc = self.processing_class
@@ -165,148 +215,53 @@ class DiffuGRPOTrainer(GRPOTrainer):
 
     def training_step(self, model, inputs, num_items_in_batch):
         time_before = time.perf_counter()
-
+       
         model.train()
         if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
             self.optimizer.train()
 
-        # GRPO-specific: this generates rollouts and prepares trajectory-level batch
-        inputs = self._prepare_inputs(inputs)
-
-        # -----------------------------------------------------------
-        # PPO MINI-BATCH SPLITTING
-        # -----------------------------------------------------------
-        ppo_tasks = getattr(self.args, "ppo_mini_batch_size", None)
-
-        if ppo_tasks is None:
-            # Fallback to original single backward behavior
-            if self.accelerator.is_main_process:
-                logger.info(f"[Step {self.state.global_step}] Update    | start | single batch, B={inputs['prompt_ids'].size(0)}")
-            _t_upd = time.perf_counter()
+            inputs = self._prepare_inputs(inputs)
             with self.compute_loss_context_manager():
                 loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
 
-            if self.args.n_gpu > 1:
-                loss = loss.mean()
+            del inputs
+            if (
+                self.args.torch_empty_cache_steps is not None
+                and self.state.global_step % self.args.torch_empty_cache_steps == 0
+            ):
+                clear_device_cache()
 
-            if (not self.model_accepts_loss_kwargs or num_items_in_batch is None) and self.compute_loss_func is None:
-                loss = loss / self.current_gradient_accumulation_steps
-
-            self.accelerator.backward(loss)
-            if self.accelerator.is_main_process:
-                logger.info(
-                    f"[Step {self.state.global_step}] Update    | done  | {time.perf_counter() - _t_upd:.1f}s, "
-                    f"loss={loss.item():.4f}"
-                )
-
-            self._step += 1
-            time_after = time.perf_counter()
-            self._current_train_step_time += time_after - time_before
-            if self._step % self.current_gradient_accumulation_steps == 0:
-                self._metrics["train"]["step_time"].append(self._current_train_step_time)
-                self._current_train_step_time = 0.0
-
-            return loss.detach()
-
-        # Convert task-level mini-batch size → trajectory-level
-        rollout_n = self.num_generations
-        ppo_mb_global = ppo_tasks * rollout_n
-
-        world = self.accelerator.num_processes
-        if ppo_mb_global % world != 0:
-            raise ValueError(
-                f"ppo_mini_batch_size (task-level={ppo_tasks}) "
-                f"* rollout.n ({rollout_n}) must be divisible by num_processes ({world})"
-            )
-
-        ppo_mb_local = ppo_mb_global // world
-        B = inputs["prompt_ids"].size(0)
-
-        if ppo_mb_local <= 0:
-            raise ValueError(f"Local PPO mini-batch size <= 0: {ppo_mb_local}")
-
-        need_ga_divide = (
-            (not self.model_accepts_loss_kwargs or num_items_in_batch is None)
-            and self.compute_loss_func is None
-        )
-        ga = float(self.current_gradient_accumulation_steps) if need_ga_divide else 1.0
-
-        total_loss = 0.0
-        n_chunks = (B + ppo_mb_local - 1) // ppo_mb_local
-        if self.accelerator.is_main_process:
-            logger.info(
-                f"[Step {self.state.global_step}] Update    | start | PPO mini-batch, "
-                f"B={B}, mb_local={ppo_mb_local}, n_chunks={n_chunks}"
-            )
-        _t_upd = time.perf_counter()
-
-        # Avoid metric duplication during chunked loss computation
-        old_skip_flag = getattr(self, "_skip_loss_metrics", False)
-
-        for start in range(0, B, ppo_mb_local):
-            end = min(start + ppo_mb_local, B)
-            chunk_bs = end - start
-            chunk_idx = start // ppo_mb_local
-
-            # Slice batch-aligned tensors
-            chunk = {}
-            for k, v in inputs.items():
-                if torch.is_tensor(v) and v.dim() >= 1 and v.size(0) == B:
-                    chunk[k] = v[start:end]
-                elif torch.is_tensor(v) and v.dim() >= 2 and v.size(1) == B:
-                    chunk[k] = v[:, start:end]
-                else:
-                    chunk[k] = v
-
-            # Scale num_items_in_batch proportionally if used
-            chunk_num_items = None
-            if num_items_in_batch is not None:
-                if torch.is_tensor(num_items_in_batch):
-                    chunk_num_items = num_items_in_batch * (chunk_bs / B)
-                else:
-                    chunk_num_items = num_items_in_batch * (chunk_bs / B)
-
-            # Skip metric logging except for final chunk
-            self._skip_loss_metrics = (end != B)
-
-            _t_chunk = time.perf_counter()
-            with self.compute_loss_context_manager():
-                chunk_loss = self.compute_loss(model, chunk, num_items_in_batch=chunk_num_items)
+            kwargs = {}
 
             if self.args.n_gpu > 1:
-                chunk_loss = chunk_loss.mean()
+                loss = loss.mean()  # mean() to average on multi-gpu parallel training
 
-            # Weight chunk to match full-batch mean gradient
-            chunk_loss = chunk_loss * (chunk_bs / B)
+            if self.use_apex:
+                from apex import amp
 
-            # Apply gradient accumulation scaling
-            chunk_loss = chunk_loss / ga
+                with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                # Finally we need to normalize the loss for reporting if GA loss bug is not fixed during compute loss
+                if (not self.model_accepts_loss_kwargs or num_items_in_batch is None) and self.compute_loss_func is None:
+                    loss = loss / self.args.gradient_accumulation_steps
 
-            self.accelerator.backward(chunk_loss)
-            if self.accelerator.is_main_process:
-                logger.info(
-                    f"[Step {self.state.global_step}] Update    | chunk {chunk_idx + 1}/{n_chunks} | "
-                    f"{time.perf_counter() - _t_chunk:.1f}s, loss={chunk_loss.item():.4f}"
-                )
+                # Turning off loss scaling w.r.t. gradient accumulation when DeepSpeed is enabled
+                # https://github.com/huggingface/transformers/pull/35808
+                if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
+                    kwargs["scale_wrt_gas"] = False
 
-            total_loss += chunk_loss.detach()
+                self.accelerator.backward(loss, **kwargs)
 
-        self._skip_loss_metrics = old_skip_flag
-        if self.accelerator.is_main_process:
-            logger.info(
-                f"[Step {self.state.global_step}] Update    | done  | {time.perf_counter() - _t_upd:.1f}s, "
-                f"total_loss={total_loss.item():.4f}"
-            )
+            output = loss.detach()
 
         self._step += 1
         time_after = time.perf_counter()
-        self._current_train_step_time += time_after - time_before
-        if self._step % self.current_gradient_accumulation_steps == 0:
+        if self._step % self.args.gradient_accumulation_steps == 0:
             self._metrics["train"]["step_time"].append(self._current_train_step_time)
             self._current_train_step_time = 0.0
-
-        return total_loss
-
+        
+        return output
 
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -318,7 +273,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
         mask_seeds = inputs["mask_seeds"]
         # Get the current iteration index and corresponding mask seed
-        this_itr_idx = self._step % self.args.num_iterations
+        this_itr_idx = (self._step - 1) % self.args.num_iterations
         this_itr_mask_seed = mask_seeds[this_itr_idx]
         # Combine prompt and completion
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
@@ -444,23 +399,16 @@ class DiffuGRPOTrainer(GRPOTrainer):
         self, inputs: dict[str, Union[torch.Tensor, Any]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
         mode = "eval" if self.control.should_evaluate else "train"
-        return_debug_artifacts = bool(getattr(self.args, "return_debug_artifacts", False))
         if mode == "train":
             if self.state.global_step % self.num_iterations == 0:
-                inputs = self._generate_and_score_completions(
-                    inputs,
-                    return_debug_artifacts=return_debug_artifacts,
-                )
+                inputs = self._generate_and_score_completions(inputs)
                 self._buffered_inputs[self._step % self.args.gradient_accumulation_steps] = inputs
             else:
                 inputs = self._buffered_inputs[self._step % self.args.gradient_accumulation_steps]
             self._step += 1
         else:
             # In evaluation, we don't reuse completions across multiple updates, so we don't need to buffer inputs.
-            inputs = self._generate_and_score_completions(
-                inputs,
-                return_debug_artifacts=return_debug_artifacts,
-            )
+            inputs = self._generate_and_score_completions(inputs)
         return inputs
 
     def _generate_and_score_completions(

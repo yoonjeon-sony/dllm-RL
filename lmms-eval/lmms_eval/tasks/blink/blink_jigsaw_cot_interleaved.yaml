@@ -9,5 +9,3 @@ lmms_eval_specific_kwargs:
     post_prompt: "\nPlease examine the images carefully, reason step by step about the visual details, and then provide your answer."
   generation_kwargs:
   max_new_tokens: 1024
-  image_gen_pre_prompt: "<image_start>"
-  image_gen_post_prompt: "</image_start>"

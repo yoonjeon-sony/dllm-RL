@@ -47,6 +47,7 @@ from llava.model.multimodal_projector.u_vit import Simple_UVitBlock
 from torch import nn
 from llava.model.multimodal_encoder.unitok import build_unitok,UniTokEmbeddings,UnitokImageProcessor
 from llava.model.dit.dit_blocks import LightDiTHead
+
 class LlavaMetaModel:
 
     def __init__(self, config,model_config=None,vision_kwargs=None,skip_init=False,**kwargs):

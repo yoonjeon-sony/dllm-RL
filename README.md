@@ -16,6 +16,8 @@ uv sync
 ```
 sbatch scripts/
 ```
+- Download dataset from 
+- Download SFT trained checkpoint from yjyjyj98/sft-lavidao-thinkmorph-edit
 
 ####  RL Training
 ```

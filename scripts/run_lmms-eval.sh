@@ -1,25 +1,26 @@
 #!/bin/bash
-#SBATCH --partition=dgm
+#SBATCH --partition=sharedp
 #SBATCH --account=dgm
 #SBATCH --job-name=lmmseval-text-vanilla
 #SBATCH --nodes=1
 #SBATCH --ntasks=1                    # 1 task per GPU
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:2
 #SBATCH --time=24:00:00               # Max time
 #SBATCH --requeue                     # allow requeue if preempted
 #SBATCH --output=slurm-logs/output.%j.log
 #SBATCH --error=slurm-logs/error.%j.log
 
-CHAT_MODE=${CHAT_MODE:-text_gen} # text_gen,image_gen
-BATCH_SIZE=${BATCH_SIZE:-16}
+CHAT_MODE=${CHAT_MODE:-image_gen} # text_gen,image_gen
+BATCH_SIZE=${BATCH_SIZE:-8}
 # CKPT="/group2/dgm/yoonjeon/ckpts/rl-lavidao-thinkmorph/thinkmorph-sft/checkpoint-250" # # CKPT="/group2/dgm/yoonjeon/LaViDa-O"
 # CKPT="/group2/dgm/yoonjeon/ckpts/sft-lavidao-thinkmorph/checkpoint-26000"
 # CKPT="/group2/dgm/yoonjeon/LaViDa-O"
 # CKPT="/group2/dgm/yoonjeon/ckpts/sft-lavidao-thinkmorph-complete/checkpoint-1000"
 CKPT="/group2/dgm/yoonjeon/ckpts/rl-lavidao-thinkmorph/thinkmorph_edit-sft/checkpoint-200"
 LIMIT=${LIMIT:-}
-NUM_GPUS=${NUM_GPUS:-4}
-TASKS="blink_jigsaw_cot_text_only,vstar_bench_cot_text_only,cv_bench_cot_text_only,VisualPuzzles_cot_text_only,chartqa_cot_text_only"
+NUM_GPUS=${NUM_GPUS:-2}
+# TASKS="blink_jigsaw_cot_text_only,vstar_bench_cot_text_only,cv_bench_cot_text_only,VisualPuzzles_cot_text_only,chartqa_cot_text_only"
+TASKS="blink_jigsaw_cot_image_only"
 # TASKS="VisualPuzzles_cot_text_only"
 if [[ "${CHAT_MODE}" != "text_gen" && "${CHAT_MODE}" != "image_gen" ]]; then
     echo "Invalid CHAT_MODE=${CHAT_MODE}. Must be text_gen or image_gen."

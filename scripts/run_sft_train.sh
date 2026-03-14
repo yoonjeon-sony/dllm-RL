@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --partition=sharedp
+#SBATCH --partition=dgm
 #SBATCH --account=dgm
 #SBATCH --job-name=zebracot_thinkmorph_sft
 #SBATCH --nodes=1
 #SBATCH --ntasks=1                    # 1 task per GPU
 #SBATCH --gres=gpu:4
-#SBATCH --time=24:00:00               # Max time
+#SBATCH --time=96:00:00               # Max time
 #SBATCH --requeue                     # allow requeue if preempted
 #SBATCH --output=slurm-logs/output.%j.log
 #SBATCH --error=slurm-logs/error.%j.log
@@ -13,7 +13,7 @@
 MODEL_PATH="/group2/dgm/yoonjeon/LaViDa-O"
 VISION_MODEL_VERSION="google/siglip-so400m-patch14-384"
 DATA_PATH=./scripts/data/thinkmorph_zebracot_complete.yaml
-IMG_PATH="/scratch2/yoonjeon.kim/"
+IMG_PATH="/group2/dgm/yoonjeon/data/"
 RUN_NAME=sft-lavidao-thinkmorph-zebracot-complete
 DEBUG=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -35,9 +35,9 @@ if [[ "${DEBUG}" == "1" ]]; then
     BATCH_SIZE=2
     EVAL_BATCH_SIZE=1
 else
-    NUM_GPUS=${NUM_GPUS:-8}
+    NUM_GPUS=${NUM_GPUS:-4}
     MAX_STEP=${MAX_STEP:-100000}
-    LOG_STEP=${LOG_STEP:-10}
+    LOG_STEP=${LOG_STEP:-1000}
     EVAL_STEP=${EVAL_STEP:-50}
     SAVE_STEP=${SAVE_STEP:-1000}
     BATCH_SIZE=${BATCH_SIZE:-8}

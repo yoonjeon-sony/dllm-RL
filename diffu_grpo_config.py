@@ -412,7 +412,7 @@ class DiffuGRPOConfig(GRPOConfig):
         metadata={
             "help": "Number of tasks (prompts) per PPO mini-batch. Each task contributes num_generations trajectories. "
             "When set, training_step splits the full rollout batch into chunks of this size for compute_loss, "
-            "reducing peak memory. Must satisfy: ppo_mini_batch_size * num_generations % num_processes == 0. "
+            "reducing peak memory. Must satisfy: ppo_mini_batch_size * num_generations / num_processes == 0. "
             "If None, the full batch is forwarded in a single call (original behavior)."
         },
     )

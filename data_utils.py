@@ -1,8 +1,8 @@
 
-
 from datasets import load_dataset, Dataset
 import pandas as pd
 from reward_func import extract_hash_answer
+import io
 import json
 import random
 import numpy as np
@@ -159,6 +159,14 @@ def convert_to_rgb(image_path):
     return image
 
 
+THINKMORPH_HF_REPO_ID = "yjyjyj98/mvot-rl-dataset"
+THINKMORPH_HF_CONFIGS = (
+    "ThinkMorph-Spatial_Navigation_loc",
+    "ThinkMorph-Visual_Search_loc",
+    "ThinkMorph-Chart_Refocus_loc",
+)
+
+
 COT_PROMPT = (
         "Let's think step-by-step to solve the question."
         "Put your final answer in <answer> <\answer> tags. "
@@ -192,57 +200,70 @@ def _build_grounding_prompt(question):
     return f'''<|startoftext|><|start_header_id|>system<|end_header_id|>\n\nYou are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n<image>\n {GROUNDING_PROMPT} {question} <|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n<LOC_BEGIN><|mdm_mask|><|mdm_mask|><|mdm_mask|><|mdm_mask|><LOC_END><|eot_id|>'''
 
 
+def _parse_bbox(raw_bbox):
+    if raw_bbox is None:
+        return None
+    if isinstance(raw_bbox, str):
+        raw_bbox = raw_bbox.strip()
+        if not raw_bbox:
+            return None
+        try:
+            raw_bbox = json.loads(raw_bbox)
+        except json.JSONDecodeError:
+            return None
+    if isinstance(raw_bbox, (list, tuple)) and len(raw_bbox) == 4:
+        try:
+            return [int(coord) for coord in raw_bbox]
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _decode_dataset_image(image_value):
+    if isinstance(image_value, Image.Image):
+        return image_value.convert("RGB") if image_value.mode != "RGB" else image_value
+    if isinstance(image_value, str):
+        return convert_to_rgb(image_value)
+    if isinstance(image_value, dict):
+        if image_value.get("bytes") is not None:
+            image = Image.open(io.BytesIO(image_value["bytes"]))
+            return image.convert("RGB") if image.mode != "RGB" else image
+        if image_value.get("path"):
+            return convert_to_rgb(image_value["path"])
+    raise TypeError(f"Unsupported ThinkMorph image value type: {type(image_value)!r}")
+
+
 def get_thinkmorph_image_editing_questions(
     split: str = "train",
     data_root: str | None = None,
     image_root: str | None = None,
     gen_type: str = "image_gen",
 ) -> Dataset:
-
-    if data_root is None:
-        data_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")
-    if image_root is None:
-        image_root = data_root
-
-    train_data_paths = [
-        os.path.join(data_root, "ThinkMorph-Spatial_Navigation_loc_train.jsonl"),
-        os.path.join(data_root, "ThinkMorph-Visual_Search_loc_train.jsonl"),
-        os.path.join(data_root, "ThinkMorph-Chart_Refocus_loc_train.jsonl"),
-    ]
-
     if split != "train":
         raise ValueError(f"Unsupported split '{split}' for ThinkMorph. Use 'train'.")
     if gen_type not in {"text_gen", "grounding", "image_gen"}:
         raise ValueError(f"Unsupported gen_type '{gen_type}'.")
 
     rows: list[dict] = []
-    for path in train_data_paths:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                example = json.loads(line)
-                gt_bbox = example.get("raw_gt_box")
-                if gen_type in {"grounding", "image_gen"} and gt_bbox is None:
-                    continue
-                edit_prompt = f"{EDIT_PROMPT} {example['question']}"
-                image_path = os.path.join(image_root, example["problem_image_0"])
-                image = convert_to_rgb(image_path)
-                grounding_prompt = _build_grounding_prompt(example["question"])
-                prompt = _build_question_prompt(example["question"])
+    for config_name in THINKMORPH_HF_CONFIGS:
+        data = load_dataset(THINKMORPH_HF_REPO_ID, config_name, split=split)
+        for example in data:
+            gt_bbox = _parse_bbox(example.get("raw_gt_box"))
+            if gen_type in {"grounding", "image_gen"} and gt_bbox is None:
+                continue
 
-                rows.append(
-                    {
-                        "prompt": prompt,
-                        "edit_prompt": edit_prompt,
-                        "grounding_prompt": grounding_prompt,
-                        "answer": example["answer"],
-                        "gt_bbox": gt_bbox,  # (x, y, x, y) in original image scale / left top & right bottom coords
-                        "image": image,
-                        "gen_type": gen_type,
-                    }
-                    
-                )
+            question = example["question"]
+            rows.append(
+                {
+                    "prompt": _build_question_prompt(question),
+                    "edit_prompt": f"{EDIT_PROMPT} {question}",
+                    "grounding_prompt": _build_grounding_prompt(question),
+                    "answer": example["answer"],
+                    "gt_bbox": gt_bbox,  # (x, y, x, y) in original image scale / left top & right bottom coords
+                    "image": _decode_dataset_image(example["problem_image_0"]),
+                    "gen_type": gen_type,
+                }
+            )
 
     return Dataset.from_list(rows)
 

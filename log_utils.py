@@ -1,7 +1,8 @@
+import os
 import math
 import random
 from transformers.utils import is_rich_available
-from transformers.trainer import is_conversational
+from trl.data_utils import apply_chat_template, is_conversational
 import torch.nn as nn
 
 
@@ -20,7 +21,7 @@ def _get_reward_func_name(reward_func):
     return reward_func.__name__
 
 def _build_reward_completions(prompts_for_reward, completion_texts):
-    if is_conversational(inputs[0]):
+    if prompts_for_reward and is_conversational({"prompt": prompts_for_reward[0]}):
         completions_for_reward = []
         for prompt, completion in zip(prompts_for_reward, completion_texts):
             completion = "" if completion is None else completion

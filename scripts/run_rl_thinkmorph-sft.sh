@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --partition=dgm
 #SBATCH --account=dgm
-#SBATCH --job-name=rl_thinkmorph-sft-text
+#SBATCH --job-name=rl_thinkmorph-sft-interleave
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:4
-#SBATCH --time=24:00:00
+#SBATCH --gres=gpu:8
+#SBATCH --time=256:00:00
 #SBATCH --requeue
 #SBATCH --output=slurm-logs/output.%j.log
 #SBATCH --error=slurm-logs/error.%j.log
@@ -27,7 +27,9 @@ MODEL_PATH="/group2/dgm/yoonjeon/ckpts/sft-lavidao-thinkmorph-complete/checkpoin
 # split into
 # 4 PPO minibatches (128 traj each)
 # 2 GEN minibatches (256 traj each)
-if [[ "${DEBUG,,}" == "1" || "${DEBUG,,}" == "true" ]]; then
+
+# Explicitly check for DEBUG being set to string "1" or "true", nothing else will trigger debug mode.
+if [[ "${DEBUG}" == "1" || "${DEBUG,,}" == "true" ]]; then
     echo "Running in debug mode!!!!"
     NUM_PROCESSES=4
     BATCH_SIZE=4
@@ -90,7 +92,7 @@ fi
     --resume_from_checkpoint true \
     --guidance_scale 0 \
     --data_root /home/yoonjeon.kim/dLLM-RL/train_sft/data/ \
-    --image_root /scratch2/yoonjeon.kim/ \
+    --image_root /group2/dgm/yoonjeon/data/ \
     --return_debug_artifacts $RETURN_DEBUG_ARTIFACTS \
     --output_dir /group2/dgm/yoonjeon/ckpts/rl-lavidao-thinkmorph/$RUN_NAME \
     "${EXTRA_ARGS[@]}" \
