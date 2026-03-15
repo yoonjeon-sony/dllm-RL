@@ -313,10 +313,8 @@ class MyProcessor(ProcessorMixin):
         if mode == "text_gen":
             return self.prepare_text_only(texts)
         elif mode == "image_gen":
-            if grounding_texts is None:
-                grounding_texts = texts
-            if edit_texts is None:
-                edit_texts = texts
+            assert grounding_texts is not None, "grounding_texts is required for image_gen mode"
+            assert edit_texts is not None, "edit_texts is required for image_gen mode"
             grounding_batch = self.prepare_text_with_images(
                 grounding_texts,
                 images,
@@ -330,8 +328,7 @@ class MyProcessor(ProcessorMixin):
             )
             return {**grounding_batch, **edit_batch}
         elif mode == "grounding":
-            if grounding_texts is None:
-                grounding_texts = texts
+            assert texts is not None, "texts is required for grounding mode"
             return self.prepare_text_with_images(grounding_texts, images, include_bbox_mask=True)
         else:
             raise ValueError(f"Invalid mode: {mode}")

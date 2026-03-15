@@ -193,11 +193,11 @@ def get_logits(model, input_emnbeddings, modality_indices=None, t2i_inference=Fa
             None,
             input_embeddings=input_emnbeddings,
             modality_indices=input_modality_indices,
-            output_hidden_states=True,
+            return_last_hidden_state_only=True,
             compute_logits=False,
             past_key_values=past_key_values,
         )
-        hidden_states = output.hidden_states[-1]
+        hidden_states = output.hidden_states[0]
         gen_hidden_states = hidden_states[modality_indices]
         gen_hidden_states = maybe_truncate_last_dim(gen_hidden_states,model.config.d_model_gen)
         gen_logits = model.call_gen_predictor(gen_hidden_states,gen_shape,timesteps=timesteps) # * 8 D

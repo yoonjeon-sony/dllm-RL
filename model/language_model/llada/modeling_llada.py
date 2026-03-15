@@ -1490,6 +1490,7 @@ class LLaDAModel(nn.Module):
         use_cache: bool = False,
         last_logits_only: bool = False,
         output_hidden_states: Optional[bool] = None,
+        return_last_hidden_state_only: bool = False,
         compute_logits: bool = True,
         prefix_length=None,
         modality_indices=None,
@@ -1603,7 +1604,7 @@ class LLaDAModel(nn.Module):
         attn_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = [] if use_cache else None
 
         # decoder layers
-        all_hidden_states = []
+        all_hidden_states = [] if output_hidden_states else None
         
         # prefix-lm
         # prefix_length: [B]
@@ -1688,6 +1689,11 @@ class LLaDAModel(nn.Module):
         if output_hidden_states:
             # add final hidden state post-final-layernorm, following HuggingFace's convention
             all_hidden_states.append(x)
+            hidden_states = tuple(all_hidden_states)
+        elif return_last_hidden_state_only:
+            hidden_states = (x,)
+        else:
+            hidden_states = None
 
         logits = None
         if compute_logits:
@@ -1700,7 +1706,7 @@ class LLaDAModel(nn.Module):
             if self.config.scale_logits:
                 logits.mul_(1 / math.sqrt(self.config.d_model))
 
-        return LLaDAOutput(logits=logits, attn_key_values=attn_key_values, hidden_states=tuple(all_hidden_states) if output_hidden_states else None)  # type: ignore[arg-type]
+        return LLaDAOutput(logits=logits, attn_key_values=attn_key_values, hidden_states=hidden_states)  # type: ignore[arg-type]
 
 
 def get_effective_n_kv_heads(config):

@@ -1036,9 +1036,7 @@ class Llava_Llada(lmms):
                     cfg_scale=0.0,
                     remasking="low_confidence",
                     mask_id=mask_id,
-                    generation_batch_size=grd_embeds.size(0),
-                    bbox_postprocess_fn=_bbox_postprocess_fn,
-                    reencode_fn=_reencode_fn,
+                    generation_batch_size=grd_embeds.size(0),            
                     image_gen_kwargs=img_gen_kwargs,
                 )
                 completion_ids = gen_result["completion_ids"]

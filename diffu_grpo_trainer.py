@@ -53,6 +53,7 @@ from llava.mm_utils import process_images, tokenizer_image_token, pad_to_square_
 from llava.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
 from llava.conversation import conv_templates
 from llava.model.language_model.llada.generate import add_gumbel_noise, get_num_transfer_tokens, cosine_schedule_2, logit_normal_schedule, exp_schedule, wte, get_logits, get_num_transfer_tokens_sch
+from llava.model.utils import maybe_truncate_last_dim
 from log_utils import (
     _align_len,
     _build_reward_completions,
@@ -64,6 +65,11 @@ from log_utils import (
     _select_by_indices,
 )
 from interleaved_inferencer import InterleavedInferencer
+from reward_func import (
+    boxed_and_answer_tags_format_reward,
+    correctness_reward_func,
+    correct_grounding_reward_func,
+)
 logger = logging.getLogger(__name__)
 
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
@@ -220,40 +226,40 @@ class DiffuGRPOTrainer(GRPOTrainer):
         if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
             self.optimizer.train()
 
-            inputs = self._prepare_inputs(inputs)
-            with self.compute_loss_context_manager():
-                loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
+        inputs = self._prepare_inputs(inputs)
+        with self.compute_loss_context_manager():
+            loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
 
-            del inputs
-            if (
-                self.args.torch_empty_cache_steps is not None
-                and self.state.global_step % self.args.torch_empty_cache_steps == 0
-            ):
-                clear_device_cache()
+        del inputs
+        if (
+            self.args.torch_empty_cache_steps is not None
+            and self.state.global_step % self.args.torch_empty_cache_steps == 0
+        ):
+            clear_device_cache()
 
-            kwargs = {}
+        kwargs = {}
 
-            if self.args.n_gpu > 1:
-                loss = loss.mean()  # mean() to average on multi-gpu parallel training
+        if self.args.n_gpu > 1:
+            loss = loss.mean()  # mean() to average on multi-gpu parallel training
 
-            if self.use_apex:
-                from apex import amp
+        if self.use_apex:
+            from apex import amp
 
-                with amp.scale_loss(loss, self.optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                # Finally we need to normalize the loss for reporting if GA loss bug is not fixed during compute loss
-                if (not self.model_accepts_loss_kwargs or num_items_in_batch is None) and self.compute_loss_func is None:
-                    loss = loss / self.args.gradient_accumulation_steps
+            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                scaled_loss.backward()
+        else:
+            # Finally we need to normalize the loss for reporting if GA loss bug is not fixed during compute loss
+            if (not self.model_accepts_loss_kwargs or num_items_in_batch is None) and self.compute_loss_func is None:
+                loss = loss / self.args.gradient_accumulation_steps
 
-                # Turning off loss scaling w.r.t. gradient accumulation when DeepSpeed is enabled
-                # https://github.com/huggingface/transformers/pull/35808
-                if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
-                    kwargs["scale_wrt_gas"] = False
+            # Turning off loss scaling w.r.t. gradient accumulation when DeepSpeed is enabled
+            # https://github.com/huggingface/transformers/pull/35808
+            if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
+                kwargs["scale_wrt_gas"] = False
 
-                self.accelerator.backward(loss, **kwargs)
+            self.accelerator.backward(loss, **kwargs)
 
-            output = loss.detach()
+        output = loss.detach()
 
         self._step += 1
         time_after = time.perf_counter()
@@ -278,11 +284,19 @@ class DiffuGRPOTrainer(GRPOTrainer):
         # Combine prompt and completion
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         logits_to_keep = completion_ids.size(1)  # only compute logits for completion tokens
-        input_ids = input_ids.unsqueeze(0)
         unwrapped_model = self.accelerator.unwrap_model(model).get_model()
-        per_token_logps = self._get_per_token_logps(
-            unwrapped_model, input_ids, logits_to_keep, [this_itr_mask_seed]
-        ).squeeze(0)
+        image_completion_ids = inputs.get("image_completion_ids")
+        per_token_logps = self._get_current_per_token_logps(
+            unwrapped_model,
+            input_ids,
+            logits_to_keep,
+            this_itr_mask_seed,
+            image_completion_ids=image_completion_ids,
+            image_input_embeds_gen=inputs.get("image_input_embeds_gen"),
+            image_is_gen=inputs.get("image_is_gen"),
+            image_is_gen_enc=inputs.get("image_is_gen_enc"),
+            image_gen_shape=inputs.get("image_gen_shape"),
+        )
         # Compute the KL divergence between the model and the reference model
         if self.args.beta != 0.0:
             ref_per_token_logps = inputs["ref_per_token_logps"][this_itr_idx].squeeze(0)
@@ -336,7 +350,150 @@ class DiffuGRPOTrainer(GRPOTrainer):
         p_mask = torch.where(prompt_index, t_p.unsqueeze(1), torch.ones_like(t_p).unsqueeze(1))
         return noisy_batch, p_mask
 
-    def _get_per_token_logps(self, model, input_ids, logits_to_keep, mask_seeds):
+    def _get_text_completion_mask(self, completion_ids):
+        if completion_ids is None:
+            return None
+        if completion_ids.size(1) == 0:
+            return torch.zeros((completion_ids.size(0), 0), dtype=torch.int, device=completion_ids.device)
+        is_eos = completion_ids == self.processing_class.tokenizer.eos_token_id
+        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=completion_ids.device)
+        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+        sequence_indices = torch.arange(is_eos.size(1), device=completion_ids.device).expand(is_eos.size(0), -1)
+        return (sequence_indices <= eos_idx.unsqueeze(1)).int()
+
+    def _get_image_completion_mask(self, image_completion_ids, edit_region_mask):
+        if image_completion_ids is None or edit_region_mask is None:
+            return None
+        if image_completion_ids.dim() == 2:
+            return edit_region_mask.to(dtype=torch.int, device=image_completion_ids.device)
+        if image_completion_ids.dim() == 3:
+            expanded_mask = edit_region_mask.unsqueeze(1).expand(-1, image_completion_ids.size(1), -1)
+            return expanded_mask.reshape(image_completion_ids.size(0), -1).to(
+                dtype=torch.int, device=image_completion_ids.device
+            )
+        raise ValueError(f"Unsupported image completion shape: {tuple(image_completion_ids.shape)}")
+
+    def _infer_image_gen_shape(self, image_completion_ids):
+        token_count = image_completion_ids.shape[-1]
+        side = int(round(math.sqrt(token_count)))
+        if side * side != token_count:
+            raise ValueError(f"Cannot infer square image gen shape from {token_count} tokens.")
+        return (side, side)
+
+    def _concat_token_logps(self, text_logps, image_logps):
+        if text_logps is None:
+            return image_logps
+        if image_logps is None:
+            return text_logps
+        return torch.cat([text_logps, image_logps], dim=-1)
+
+    def _get_current_per_token_logps(
+        self,
+        model,
+        input_ids,
+        logits_to_keep,
+        mask_seed,
+        image_completion_ids=None,
+        image_input_embeds_gen=None,
+        image_is_gen=None,
+        image_is_gen_enc=None,
+        image_gen_shape=None,
+    ):
+        if mask_seed is not None and isinstance(mask_seed, torch.Tensor):
+            mask_seed = mask_seed.item()
+
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
+        prompt_length = seq_len - logits_to_keep
+        prompt_index = torch.zeros(seq_len, dtype=torch.bool, device=device)
+        prompt_index[:prompt_length] = True
+
+        perturbed_seq, _ = self.forward_process(input_ids, prompt_index, self.args.mask_id, seed=mask_seed)
+        text_inputs_embeds = model.transformer.wte(perturbed_seq)
+        text_targets = input_ids[:, -logits_to_keep:]
+
+        if image_completion_ids is None:
+            text_output = model(
+                None,
+                input_embeddings=text_inputs_embeds,
+                return_last_hidden_state_only=True,
+                compute_logits=False,
+            )
+            completion_hidden_states = text_output.hidden_states[0][:, -logits_to_keep:, :]
+            if model.config.weight_tying:
+                completion_logits = F.linear(completion_hidden_states, model.transformer.wte.weight, None)
+            else:
+                completion_logits = model.transformer.ff_out(completion_hidden_states)
+            if model.config.scale_logits:
+                completion_logits = completion_logits * (1 / math.sqrt(model.config.d_model))
+            flat_logits = completion_logits.reshape(-1, completion_logits.size(-1))
+            flat_targets = text_targets.reshape(-1)
+            loss = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+            per_token_logps = (-loss.view(batch_size, logits_to_keep)).to(torch.float32)
+            del text_output, completion_hidden_states
+            return per_token_logps
+
+        if image_gen_shape is None:
+            image_gen_shape = self._infer_image_gen_shape(image_completion_ids)
+
+        perturbed_latents = torch.full_like(image_completion_ids, 8193)
+        image_inputs_embeds = image_input_embeds_gen.clone()
+        image_all_input_embeddings, _ = wte(
+            model,
+            None,
+            True,
+            x_gen=perturbed_latents,
+            gen_shape=image_gen_shape,
+            inputs_embeds_curr=image_inputs_embeds,
+            new_token_mask=image_is_gen,
+        )
+        enc_use_image_branch = getattr(model.config, "enc_use_image_branch", False)
+        image_forward_modality_indices = image_is_gen | image_is_gen_enc if enc_use_image_branch else image_is_gen
+        text_modality_indices = torch.zeros(text_inputs_embeds.shape[:2], dtype=torch.bool, device=device)
+        combined_embeds = torch.cat([text_inputs_embeds, image_all_input_embeddings], dim=1)
+        combined_modality_indices = torch.cat([text_modality_indices, image_forward_modality_indices], dim=1)
+        combined_output = model(
+            None,
+            input_embeddings=combined_embeds,
+            modality_indices=combined_modality_indices,
+            return_last_hidden_state_only=True,
+            compute_logits=False,
+        )
+        combined_hidden_states = combined_output.hidden_states[0]
+        completion_hidden_states = combined_hidden_states[:, seq_len - logits_to_keep : seq_len, :]
+        if model.config.weight_tying:
+            completion_logits = F.linear(completion_hidden_states, model.transformer.wte.weight, None)
+        else:
+            completion_logits = model.transformer.ff_out(completion_hidden_states)
+        if model.config.scale_logits:
+            completion_logits = completion_logits * (1 / math.sqrt(model.config.d_model))
+        flat_text_logits = completion_logits.reshape(-1, completion_logits.size(-1))
+        flat_text_targets = text_targets.reshape(-1)
+        text_loss = F.cross_entropy(flat_text_logits, flat_text_targets, reduction="none")
+        text_per_token_logps = -text_loss.view(batch_size, logits_to_keep)
+
+        image_hidden_states = combined_hidden_states[:, seq_len:, :]
+        gen_hidden_states = image_hidden_states[image_is_gen]
+        gen_hidden_states = maybe_truncate_last_dim(gen_hidden_states, model.config.d_model_gen)
+        timesteps = torch.ones(batch_size, device=device, dtype=torch.float32)
+        image_logits = model.call_gen_predictor(gen_hidden_states, image_gen_shape, timesteps=timesteps)
+        seq_len_per_img = int(np.prod(image_gen_shape))
+        if len(image_logits.shape) == 2:
+            image_logits = image_logits.view(-1, seq_len_per_img, image_logits.shape[-1])
+            flat_image_logits = image_logits.reshape(-1, image_logits.size(-1))
+        else:
+            image_logits = image_logits.view(-1, seq_len_per_img, *image_logits.shape[-2:])
+            image_logits = image_logits.permute(0, 2, 1, 3).contiguous()
+            flat_image_logits = image_logits.view(-1, image_logits.size(-1))
+        flat_image_targets = image_completion_ids.reshape(-1)
+        image_loss = F.cross_entropy(flat_image_logits.float(), flat_image_targets, reduction="none")
+        image_per_token_logps = -image_loss.view(batch_size, -1)
+        per_token_logps = torch.cat([text_per_token_logps, image_per_token_logps], dim=1).to(torch.float32)
+        del combined_output, combined_hidden_states, completion_hidden_states, image_hidden_states, gen_hidden_states
+        del image_logits, image_all_input_embeddings, combined_embeds
+        return per_token_logps
+
+    def _get_text_per_token_logps(self, model, input_ids, logits_to_keep, mask_seeds):
         """
         Calculate per-token log probabilities.
         """
@@ -391,9 +548,145 @@ class DiffuGRPOTrainer(GRPOTrainer):
 
         # Clean up memory
         del perturbed_seq, logits, all_perturbed_seqs, all_expanded_inputs
-        torch.cuda.empty_cache()
         per_token_logps = per_token_logps.to(torch.float32)
         return per_token_logps
+
+    def _get_image_per_token_logps(
+        self,
+        model,
+        image_completion_ids,
+        image_input_embeds_gen,
+        image_is_gen,
+        image_is_gen_enc,
+        image_gen_shape,
+        mask_seeds,
+    ):
+        if image_completion_ids is None:
+            return None
+
+        num_iterations = len(mask_seeds)
+        batch_size = image_input_embeds_gen.size(0)
+        device = image_input_embeds_gen.device
+        img_mask_id = 8193
+        enc_use_image_branch = getattr(model.config, "enc_use_image_branch", False)
+        if image_gen_shape is None:
+            image_gen_shape = self._infer_image_gen_shape(image_completion_ids)
+
+        per_token_logps = []
+        checkpoint_strategy = getattr(model, "activation_checkpointing_strategy", None)
+        disable_checkpointing = torch.is_grad_enabled() and hasattr(model, "set_activation_checkpointing")
+        if disable_checkpointing:
+            model.set_activation_checkpointing(None)
+        try:
+            for mask_seed in mask_seeds:
+                if mask_seed is not None and isinstance(mask_seed, torch.Tensor):
+                    mask_seed = mask_seed.item()
+                set_seed(mask_seed)
+                perturbed_latents = torch.full_like(image_completion_ids, img_mask_id)
+                inputs_embeds_curr = image_input_embeds_gen.clone()
+                all_input_embeddings, new_token_mask = wte(
+                    model,
+                    None,
+                    True,
+                    x_gen=perturbed_latents,
+                    gen_shape=image_gen_shape,
+                    inputs_embeds_curr=inputs_embeds_curr,
+                    new_token_mask=image_is_gen,
+                )
+                forward_modality_indices = image_is_gen | image_is_gen_enc if enc_use_image_branch else image_is_gen
+                timesteps = torch.ones(batch_size, device=device, dtype=torch.float32)
+                logits = get_logits(
+                    model,
+                    all_input_embeddings,
+                    image_is_gen,
+                    True,
+                    gen_shape=image_gen_shape,
+                    timesteps=timesteps,
+                    input_modality_indices=forward_modality_indices,
+                )
+
+                if image_completion_ids.dim() == 3:
+                    logits = logits.permute(0, 2, 1, 3).contiguous()
+                    flat_logits = logits.view(-1, logits.size(-1))
+                    flat_targets = image_completion_ids.reshape(-1)
+                elif image_completion_ids.dim() == 2:
+                    flat_logits = logits.reshape(-1, logits.size(-1))
+                    flat_targets = image_completion_ids.reshape(-1)
+                else:
+                    raise ValueError(f"Unsupported image completion shape: {tuple(image_completion_ids.shape)}")
+
+                loss = F.cross_entropy(flat_logits.float(), flat_targets, reduction="none")
+                per_token_logps.append(-loss.view(batch_size, -1))
+        finally:
+            if disable_checkpointing:
+                model.set_activation_checkpointing(checkpoint_strategy)
+
+        return torch.stack(per_token_logps, dim=0).to(torch.float32)
+
+    def _compute_multimodal_rewards(
+        self,
+        gen_type,
+        prompts_text,
+        grounding_prompts,
+        answer_completions_text,
+        grounding_completions_text,
+        inputs,
+        device,
+    ):
+        reward_kwargs = {
+            key: [example[key] for example in inputs]
+            for key in inputs[0]
+            if key not in ["prompt", "completion", "answer", "gt_bbox"]
+        }
+        answer_values = [example.get("answer") for example in inputs]
+        bbox_values = [example.get("gt_bbox", example.get("answer")) for example in inputs]
+
+        reward_names = []
+        reward_columns = []
+        answer_correctness_scores = None
+
+        if gen_type != "grounding":
+            answer_completions = _build_reward_completions(prompts_text, answer_completions_text)
+            answer_correctness_scores = correctness_reward_func(
+                prompts=prompts_text,
+                completions=answer_completions,
+                answer=answer_values,
+                step=self._step,
+                run_name=self.args.output_dir,
+                **reward_kwargs,
+            )
+            answer_format_scores = boxed_and_answer_tags_format_reward(
+                prompts=prompts_text,
+                completions=answer_completions,
+                answer=answer_values,
+                step=self._step,
+                run_name=self.args.output_dir,
+                **reward_kwargs,
+            )
+            reward_names.extend(["answer_correctness", "answer_format"])
+            reward_columns.extend([answer_correctness_scores, answer_format_scores])
+
+        if gen_type in {"grounding", "image_gen"}:
+            grounding_iou_scores = correct_grounding_reward_func(
+                prompts=grounding_prompts,
+                completions=grounding_completions_text,
+                answer=bbox_values,
+                step=self._step,
+                run_name=self.args.output_dir,
+                **reward_kwargs,
+            )
+            reward_names.append("grounding_iou")
+            reward_columns.append(grounding_iou_scores)
+
+        if gen_type == "image_gen":
+            reward_names.append("image_correctness_proxy")
+            reward_columns.append(list(answer_correctness_scores))
+
+        rewards_per_func = torch.stack(
+            [torch.tensor(column, dtype=torch.float32, device=device) for column in reward_columns],
+            dim=1,
+        )
+        return rewards_per_func, reward_names
 
     def _prepare_inputs(
         self, inputs: dict[str, Union[torch.Tensor, Any]]
@@ -437,9 +730,6 @@ class DiffuGRPOTrainer(GRPOTrainer):
         assert gen_type in ["text_gen", "image_gen", "grounding"], f"Invalid generation type: {gen_type}"
 
         if gen_type == "image_gen":
-            grounding_batch = self.processing_class.prepare_text_with_images(grounding_prompts, images, include_bbox_mask=True)
-            prompt_batch = self.processing_class.prepare_text_with_images(prompts_text, images, include_bbox_mask=False)
-
             batch_inputs = self.processing_class(
                 texts=prompts_text,
                 grounding_texts=grounding_prompts,
@@ -455,6 +745,9 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 mode="image_gen",
                 do_cfg= self.args.guidance_scale > 0 ,
             )
+            generation_prompts = edit_prompts
+            input_embeds = batch_inputs["input_embeds"]
+            attention_mask = batch_inputs["attention_mask"]
         elif gen_type == "grounding":
             batch_inputs = self.processing_class(
                 texts=grounding_prompts,
@@ -468,6 +761,9 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 dtype=torch.bfloat16,
                 mode="grounding",
             )
+            generation_prompts = grounding_prompts
+            input_embeds = batch_inputs["input_embeds"]
+            attention_mask = batch_inputs["attention_mask"]
         else:
             batch_inputs = self.processing_class(
                 texts=prompts_text,
@@ -480,13 +776,11 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 dtype=torch.bfloat16,
                 mode="text_gen",
             )
-
-        generation_prompts = grounding_prompts if gen_type == "grounding" else prompts_text
-        input_embeds = batch_inputs["input_embeds"]
-        attention_mask = batch_inputs["attention_mask"]
+            generation_prompts = prompts_text
+            input_embeds = batch_inputs["input_embeds"]
+            attention_mask = batch_inputs["attention_mask"]
+        
         bbox_mask = batch_inputs.get("bbox_mask", None)
-        if gen_type in {"grounding", "image_gen"} and bbox_mask is None:
-            raise ValueError("bbox_mask is required for grounding and image_gen modes.")
         pred_bboxes_all = [None] * len(inputs)
         edited_images_all = [None] * len(inputs)
         image_gen_debug_all = [None] * len(inputs)
@@ -512,6 +806,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
             init_images = None
             image_sizes = None
             bbox_ids = None
+            image_gen_kwargs = None
             if gen_type == "image_gen":
                 init_images = []
                 target_resolution = 1024
@@ -528,8 +823,6 @@ class DiffuGRPOTrainer(GRPOTrainer):
                     init_images.append(sample_image)
                 image_sizes = [(target_resolution, target_resolution)] * len(init_images)
 
-            image_gen_kwargs = None
-            if gen_type == "image_gen":
                 image_gen_kwargs = dict(
                     guidance_scale=self.args.guidance_scale,
                     guidance_scale_image=self.args.guidance_scale_image,
@@ -585,40 +878,59 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 max_prompt_length=self.max_prompt_length,
                 device=device,
             )
-            completion_ids = gen_result["completion_ids"]
-            prompt_mask = gen_result["prompt_mask"]
-            bbox_ids = gen_result.get("bbox_ids")
-            if gen_type in {"grounding", "image_gen"}:
-                pred_bboxes_all = gen_result.get("pred_bboxes", pred_bboxes_all)
-                bbox_texts = gen_result.get("bbox_texts")
-                if bbox_texts is None and bbox_ids is not None:
-                    bbox_texts = self.processing_class.tokenizer.batch_decode(
-                        bbox_ids, skip_special_tokens=False
-                    )
-                if bbox_texts is not None:
-                    grounding_bbox_completion_text_all = bbox_texts
+            text_completion_ids_raw = gen_result.get("completion_ids")
             if gen_type == "image_gen":
-                edited_images_all = gen_result.get("edited_images", edited_images_all)
-                if return_debug_artifacts:
-                    image_gen_debug_all = gen_result.get("image_gen_debug", image_gen_debug_all)
+                image_completion_ids = gen_result["edit_completion_ids"]
+                edit_region_mask = gen_result["edit_region_mask"]
+                image_input_embeds_gen = gen_result["image_input_embeds_gen"]
+                image_is_gen = gen_result["image_is_gen"]
+                image_is_gen_enc = gen_result["image_is_gen_enc"]
+                image_gen_shape = self._infer_image_gen_shape(image_completion_ids)
+                edited_images_all = gen_result["edited_images"]
+            else:
+                image_completion_ids = None
+                edit_region_mask = None
+                image_input_embeds_gen = None
+                image_is_gen = None
+                image_is_gen_enc = None
+                image_gen_shape = None
+
+            if gen_type in {"grounding", "image_gen"}:
+                ground_completion_ids = gen_result.get("ground_completion_ids")
+                pred_bboxes_all = gen_result["pred_bboxes"]
+                bbox_texts = gen_result["bbox_texts"]
+                grounding_bbox_completion_text_all = bbox_texts
+            else:
+                ground_completion_ids = None
+            
         self.inferencer.model = self.model
         if self.accelerator.is_main_process:
             logger.info(
                 f"[Step {self.state.global_step}] Generate  | done  | {time.perf_counter() - _t_gen:.1f}s"
             )
 
-        # With prefix_lm=True, generate() returns only the gen_length completion tokens.
-        # The prompt was handled via embeddings, so prompt_ids is empty.
-        prompt_ids = completion_ids[:, :0]      # empty, shape [bs, 0]
+        batch_size = len(inputs)
+        prompt_ids = torch.empty((batch_size, 0), dtype=torch.long, device=device)
+        prompt_mask = torch.empty((batch_size, 0), dtype=torch.int, device=device)
 
-        is_eos = completion_ids == self.processing_class.tokenizer.eos_token_id
-        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
-        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
-        sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
-        completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
-        logits_to_keep = completion_ids.size(
-            1
-        )  # we only need to compute the logits for the completion tokens
+        if gen_type == "grounding":
+            completion_ids = ground_completion_ids
+            text_completion_mask = torch.ones_like(ground_completion_ids, dtype=torch.int)
+        elif gen_type == "image_gen":
+            grounding_completion_mask = torch.ones_like(ground_completion_ids, dtype=torch.int)
+            answer_completion_mask = self._get_text_completion_mask(text_completion_ids_raw)
+            completion_ids = torch.cat([ground_completion_ids, text_completion_ids_raw], dim=1)
+            text_completion_mask = torch.cat([grounding_completion_mask, answer_completion_mask], dim=1)
+        else:
+            completion_ids = text_completion_ids_raw
+            text_completion_mask = self._get_text_completion_mask(text_completion_ids_raw)
+
+        image_completion_mask = self._get_image_completion_mask(image_completion_ids, edit_region_mask)
+        completion_mask = text_completion_mask
+        if image_completion_mask is not None:
+            completion_mask = torch.cat([completion_mask, image_completion_mask], dim=1)
+
+        logits_to_keep = completion_ids.size(1)
         if self.args.random_masking:
             # use random seeds for every iterations in GRPO iterations
             mask_seeds = torch.randint(0, 2**12, (self.num_iterations,), device=device)
@@ -638,19 +950,28 @@ class DiffuGRPOTrainer(GRPOTrainer):
                         f"n_iter={self.num_iterations}, logits_to_keep={logits_to_keep}"
                     )
                 _t_old = time.perf_counter()
-                old_per_token_logps = self._get_per_token_logps(
+                old_text_per_token_logps = self._get_text_per_token_logps(
                     self.accelerator.unwrap_model(self.model).get_model(),
                     prompt_completion_ids_expanded,
                     logits_to_keep,
                     mask_seeds,
                 )
-                all_old_per_token_logps = old_per_token_logps
+                old_image_per_token_logps = self._get_image_per_token_logps(
+                    self.accelerator.unwrap_model(self.model).get_model(),
+                    image_completion_ids,
+                    image_input_embeds_gen,
+                    image_is_gen,
+                    image_is_gen_enc,
+                    image_gen_shape,
+                    mask_seeds,
+                )
+                all_old_per_token_logps = self._concat_token_logps(
+                    old_text_per_token_logps, old_image_per_token_logps
+                )
                 if self.accelerator.is_main_process:
                     logger.info(
                         f"[Step {self.state.global_step}] Old logps | done  | {time.perf_counter() - _t_old:.1f}s"
                     )
-            else:
-                old_per_token_logps = None
 
             if self.args.beta == 0.0:
                 ref_per_token_logps = None
@@ -662,45 +983,48 @@ class DiffuGRPOTrainer(GRPOTrainer):
                     )
                 _t_ref = time.perf_counter()
                 with self.accelerator.unwrap_model(self.model).disable_adapter():
-                    ref_per_token_logps = self._get_per_token_logps(
+                    ref_text_per_token_logps = self._get_text_per_token_logps(
                         self.accelerator.unwrap_model(self.model).get_model(),
                         prompt_completion_ids_expanded,
                         logits_to_keep,
                         mask_seeds,
                     )
-                    all_ref_per_token_logps = ref_per_token_logps
+                    ref_image_per_token_logps = self._get_image_per_token_logps(
+                        self.accelerator.unwrap_model(self.model).get_model(),
+                        image_completion_ids,
+                        image_input_embeds_gen,
+                        image_is_gen,
+                        image_is_gen_enc,
+                        image_gen_shape,
+                        mask_seeds,
+                    )
+                    all_ref_per_token_logps = self._concat_token_logps(
+                        ref_text_per_token_logps, ref_image_per_token_logps
+                    )
                 if self.accelerator.is_main_process:
                     logger.info(
                         f"[Step {self.state.global_step}] Ref logps | done  | {time.perf_counter() - _t_ref:.1f}s"
                     )
 
-        decode_skip_special_tokens = gen_type != "grounding"
-        completions_text = self.processing_class.tokenizer.batch_decode(
-            completion_ids, skip_special_tokens=decode_skip_special_tokens
-        )
-        reward_prompts = grounding_prompts if gen_type == "grounding" else prompts_text
-        completions = _build_reward_completions(reward_prompts, completions_text)
-        answer_reward_prompts = prompts_text
-        answer_completions_text = completions_text
-        answer_completions = _build_reward_completions(answer_reward_prompts, answer_completions_text)
-        grounding_reward_prompts = grounding_prompts
-        grounding_completions_text = grounding_bbox_completion_text_all
-        if gen_type == "grounding":
-            grounding_completions_text = completions_text
-        elif bbox_ids is not None and not any(x is not None for x in grounding_completions_text):
-            grounding_completions_text = self.processing_class.tokenizer.batch_decode(
-                bbox_ids, skip_special_tokens=False
+        answer_completions_text = [""] * batch_size
+        if text_completion_ids_raw is not None:
+            answer_completions_text = self.processing_class.tokenizer.batch_decode(
+                text_completion_ids_raw, skip_special_tokens=True
             )
-        grounding_completions = _build_reward_completions(
-            grounding_reward_prompts,
-            grounding_completions_text,
-        )
-        log_prompts = reward_prompts
+
+        grounding_completions_text = grounding_bbox_completion_text_all
+        if ground_completion_ids is not None and not any(x is not None for x in grounding_completions_text):
+            grounding_completions_text = self.processing_class.tokenizer.batch_decode(
+                ground_completion_ids, skip_special_tokens=False
+            )
+
+        completions_text = grounding_completions_text if gen_type == "grounding" else answer_completions_text
+        log_prompts = grounding_prompts if gen_type == "grounding" else prompts_text
         log_completions_text = completions_text
         if gen_type == "image_gen":
             log_prompts = [
                 _format_image_gen_prompt_log(grounding_prompt, answer_prompt)
-                for grounding_prompt, answer_prompt in zip(grounding_reward_prompts, answer_reward_prompts)
+                for grounding_prompt, answer_prompt in zip(grounding_prompts, prompts_text)
             ]
             log_completions_text = [
                 _format_image_gen_completion_log(grounding_completion, answer_completion)
@@ -708,66 +1032,67 @@ class DiffuGRPOTrainer(GRPOTrainer):
                     grounding_completions_text, answer_completions_text
                 )
             ]
-
-        rewards_per_func = torch.zeros(len(prompts_text), len(self.reward_funcs), device=device)
-        last_reward_prompts = reward_prompts
-        last_reward_completions = completions
-        for i, (reward_func, reward_processing_class) in enumerate(
-            zip(self.reward_funcs, self.reward_processing_classes)
-        ):
-            reward_func_name = _get_reward_func_name(reward_func)
-            with profiling_context(self, reward_func_name):
-
-                # Repeat all input columns (but "prompt" and "completion") to match the number of generations
-                keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
-                reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
-                current_reward_prompts = reward_prompts
-                current_reward_completions = completions
-                if gen_type == "image_gen":
-                    if reward_func_name == "correct_grounding_reward_func":
-                        current_reward_prompts = grounding_reward_prompts
-                        current_reward_completions = grounding_completions_text
-                    else:
-                        current_reward_prompts = answer_reward_prompts
-                        current_reward_completions = answer_completions
-                if reward_func_name == "coding_reward_func":
-                    reward_kwargs["cwd_path"] = os.path.join(self.args.output_dir, "execution_files")
-                if reward_func_name == "correct_grounding_reward_func":
-                    reward_kwargs["answer"] = [
-                        example.get("gt_bbox", example.get("answer")) for example in inputs
-                    ]
-                last_reward_prompts = current_reward_prompts
-                last_reward_completions = current_reward_completions
-                output_reward_func = reward_func(
-                    prompts=current_reward_prompts,
-                    completions=current_reward_completions,
-                    step=self._step,
-                    run_name=self.args.output_dir,
-                    **reward_kwargs,
-                )
-                # Convert None values to NaN
-                output_reward_func = [
-                    reward if reward is not None else torch.nan for reward in output_reward_func
-                ]
-
-                rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
-
-        # If all reward functions return None for a given row, issue a detailed warning
-        if torch.isnan(rewards_per_func).all(dim=1).any():
-            nan_row_idx = torch.isnan(rewards_per_func).all(dim=1).nonzero(as_tuple=True)[0][0]
-            row_reward_kwargs = {key: value[nan_row_idx] for key, value in reward_kwargs.items()}
-            row_reward_kwargs["prompt"] = last_reward_prompts[nan_row_idx]
-            row_reward_kwargs["completion"] = last_reward_completions[nan_row_idx]
-            warnings.warn(
-                f"All reward functions returned None for the following kwargs: {row_reward_kwargs}. "
-                "Please ensure that at least one reward function returns a valid reward."
+        is_multimodal_reward_routing = gen_type in {"grounding", "image_gen"} or any(
+            image is not None for image in original_images_all
+        )
+        if is_multimodal_reward_routing:
+            rewards_per_func, reward_names = self._compute_multimodal_rewards(
+                gen_type,
+                prompts_text,
+                grounding_prompts,
+                answer_completions_text,
+                grounding_completions_text,
+                inputs,
+                device,
             )
+            rewards_per_func = gather(rewards_per_func)
+            rewards = rewards_per_func.sum(dim=1)
+        else:
+            reward_prompts = prompts_text
+            completions = _build_reward_completions(reward_prompts, completions_text)
+            rewards_per_func = torch.zeros(len(prompts_text), len(self.reward_funcs), device=device)
+            last_reward_prompts = reward_prompts
+            last_reward_completions = completions
+            for i, (reward_func, reward_processing_class) in enumerate(
+                zip(self.reward_funcs, self.reward_processing_classes)
+            ):
+                reward_func_name = _get_reward_func_name(reward_func)
+                with profiling_context(self, reward_func_name):
+                    keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
+                    reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
+                    if reward_func_name == "coding_reward_func":
+                        reward_kwargs["cwd_path"] = os.path.join(self.args.output_dir, "execution_files")
+                    last_reward_prompts = reward_prompts
+                    last_reward_completions = completions
+                    output_reward_func = reward_func(
+                        prompts=reward_prompts,
+                        completions=completions,
+                        step=self._step,
+                        run_name=self.args.output_dir,
+                        **reward_kwargs,
+                    )
+                    output_reward_func = [
+                        reward if reward is not None else torch.nan for reward in output_reward_func
+                    ]
+                    rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
-        rewards_per_func = gather(rewards_per_func)
-        rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
+            if torch.isnan(rewards_per_func).all(dim=1).any():
+                nan_row_idx = torch.isnan(rewards_per_func).all(dim=1).nonzero(as_tuple=True)[0][0]
+                row_reward_kwargs = {key: value[nan_row_idx] for key, value in reward_kwargs.items()}
+                row_reward_kwargs["prompt"] = last_reward_prompts[nan_row_idx]
+                row_reward_kwargs["completion"] = last_reward_completions[nan_row_idx]
+                warnings.warn(
+                    f"All reward functions returned None for the following kwargs: {row_reward_kwargs}. "
+                    "Please ensure that at least one reward function returns a valid reward."
+                )
+
+            rewards_per_func = gather(rewards_per_func)
+            rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
+            reward_names = [_get_reward_func_name(reward_func) for reward_func in self.reward_funcs]
+
         reward_columns_to_log = {"reward": rewards.tolist()}
-        for i, reward_func in enumerate(self.reward_funcs):
-            reward_columns_to_log[_get_reward_func_name(reward_func)] = rewards_per_func[:, i].tolist()
+        for i, reward_name in enumerate(reward_names):
+            reward_columns_to_log[reward_name] = rewards_per_func[:, i].tolist()
 
         # Compute grouped-wise rewards
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
@@ -796,9 +1121,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
         self._metrics[mode]["zero_std_ratio"].append(zero_std_ratio)
 
         # Calculate mean reward per function, but only for samples where the function was applied
-        for i, reward_func in enumerate(self.reward_funcs):
-            reward_func_name = _get_reward_func_name(reward_func)
-            # Only calculate mean for samples where this reward function was applied (non-NaN values)
+        for i, reward_func_name in enumerate(reward_names):
             mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
             self._metrics[mode][f"rewards/{reward_func_name}"].append(mean_rewards)
         self._metrics[mode]["reward"].append(rewards.mean().item())
@@ -923,6 +1246,20 @@ class DiffuGRPOTrainer(GRPOTrainer):
             "advantages": advantages,
             "mask_seeds": mask_seeds,  # Store all mask seeds for consistent mask patterns
         }
+        if text_completion_ids_raw is not None:
+            result["text_completion_ids_raw"] = text_completion_ids_raw
+            result["answer_completions_text"] = answer_completions_text
+        if ground_completion_ids is not None:
+            result["ground_completion_ids"] = ground_completion_ids
+            result["grounding_completions_text"] = grounding_completions_text
+        if image_completion_ids is not None:
+            result["image_completion_ids"] = image_completion_ids
+            result["image_completion_mask"] = image_completion_mask
+            result["edit_region_mask"] = edit_region_mask
+            result["image_input_embeds_gen"] = image_input_embeds_gen
+            result["image_is_gen"] = image_is_gen
+            result["image_is_gen_enc"] = image_is_gen_enc
+            result["image_gen_shape"] = image_gen_shape
         if return_debug_artifacts and gen_type == "image_gen":
             result["pred_bboxes"] = pred_bboxes_all
             result["edited_images"] = edited_images_all

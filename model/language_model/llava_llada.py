@@ -896,8 +896,8 @@ class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
                     "is_unitok": bool(is_unitok),
                     "samples": debug_samples,
                 }
-                return edited_images, debug_payload
-            return edited_images
+                return edited_images, debug_payload, mask_idx_2d
+            return edited_images, xt, mask_idx_2d
 
         schedule_positions = torch.arange(mask_idx.shape[1], device=device).unsqueeze(0)
         schedule_mask = schedule_positions < n_mask_per_sample.unsqueeze(1)
@@ -1129,8 +1129,8 @@ class LlavaLladaForMaskedDiffusion(LLaDAModelLM,LlavaMetaForCausalLM):
                 "n_steps": n_steps,
                 "step_images": step_images,
             }
-            return edited_images, debug_payload
-        return edited_images
+            return edited_images, debug_payload, mask_idx_2d
+        return edited_images, xt, mask_idx_2d
 
 
     @torch.no_grad()
