@@ -7,3 +7,5 @@ llava.egg-info
 outputs
 slurm-logs
 wandb
+scripts
+**__pycache__/** *

@@ -15,7 +15,7 @@ VISION_MODEL_VERSION="google/siglip-so400m-patch14-384"
 DATA_PATH=./scripts/data/thinkmorph_zebracot_complete.yaml
 IMG_PATH="/group2/dgm/yoonjeon/data/"
 RUN_NAME=sft-lavidao-thinkmorph-zebracot-complete
-DEBUG=1
+DEBUG=0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export SELECT_ONE_INDEX=0
 export DEBUG_FIX_PADDING=1
@@ -28,7 +28,6 @@ NUM_CKPT=32
 
 if [[ "${DEBUG}" == "1" ]]; then
     NUM_GPUS=4
-    MAX_STEP=10
     LOG_STEP=5
     EVAL_STEP=5
     SAVE_STEP=10
@@ -36,7 +35,6 @@ if [[ "${DEBUG}" == "1" ]]; then
     EVAL_BATCH_SIZE=1
 else
     NUM_GPUS=${NUM_GPUS:-4}
-    MAX_STEP=${MAX_STEP:-100000}
     LOG_STEP=${LOG_STEP:-1000}
     EVAL_STEP=${EVAL_STEP:-50}
     SAVE_STEP=${SAVE_STEP:-1000}

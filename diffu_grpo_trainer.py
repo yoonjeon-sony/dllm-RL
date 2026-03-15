@@ -418,8 +418,6 @@ class DiffuGRPOTrainer(GRPOTrainer):
     ) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
 
-        
-
         prompts_text = [x["prompt"] for x in inputs]
         grounding_prompts = [x.get("grounding_prompt", x["prompt"]) for x in inputs]
         edit_prompts = [x.get("edit_prompt", x["prompt"]) for x in inputs]
