@@ -7,7 +7,178 @@ import torch
 import copy
 
 
-class MyProcessor(ProcessorMixin):
+from transformers import ProcessorMixin
+from llava.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
+from llava.mm_utils import process_images, tokenizer_image_token, pad_to_square_and_resize
+from llava.model.utils import pad_along_last_dim
+from llava.model.sampling import get_mask_schedule
+from llava.model.prompting_utils import UniversalPrompting
+from llava.conversation import conv_templates
+import torch
+import copy
+
+from torchvision import transforms
+def image_transform(image, resolution=256, normalize=True):
+    image = transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BICUBIC)(image)
+    image = transforms.CenterCrop((resolution, resolution))(image)
+    image = transforms.ToTensor()(image)
+    if normalize:
+        image = transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)(image)
+    return image
+
+def image_transform_squash(image, resolution=256, normalize=True):
+    image = transforms.Resize((resolution,resolution), interpolation=transforms.InterpolationMode.BICUBIC)(image)
+    image = transforms.ToTensor()(image)
+    if normalize:
+        image = transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)(image)
+    return image
+
+class MMADAProcessor(ProcessorMixin):
+    
+    def __init__(self, model, tokenizer, vq_model, max_seq_len):
+
+        self.model = model # MMadaModelLM
+        self.tokenizer = tokenizer
+        self.vq_model = vq_model
+        self.uni_prompting = UniversalPrompting(
+            tokenizer,
+            max_text_len=max_seq_len,
+            special_tokens=(
+                "<|soi|>", "<|eoi|>", "<|sov|>", "<|eov|>", "<|t2i|>",
+                "<|mmu|>", "<|t2v|>", "<|v2v|>", "<|lvg|>"
+            ),
+            ignore_id=-100,
+            cond_dropout_prob=0.1,
+            use_reserved_token=True
+        )
+        self.resolution = 512
+        self.w_clip_vit = False
+        self.new_vocab_size = 134656
+        self.llm_vocab_size = 126464
+        self.codebook_size = 8192
+        self.num_vq_tokens = 1024
+        self.num_new_special_tokens = 0
+        self.tie_word_embeddings = False
+        self.mask_token_id = 126336
+        self.guidance_scale = 0 # Maybe make it 5
+        self.mask_schedule = "cosine"
+        
+
+    def prepare_mmu(self, questions, image_paths):
+        
+        messages = [[{"role": "user", "content": question}] for question in questions]
+        image_list = []
+        for image_path in image_paths:
+            image_ori = Image.open(image_path).convert("RGB")
+            if any(tag in file_name for tag in ['ai2d', 'clevr', 'docvqa', 'geo', 'llava']):
+                image = image_transform_squash(image_ori, resolution=self.resolution).to(device)
+            else:
+                image = image_transform(image_ori, resolution=self.resolution).to(device)
+            image_list.append(image)
+        image = torch.stack(image_list, dim=0)
+        image_tokens = self.vq_model.get_code(image) + len(self.uni_prompting.text_tokenizer)
+        text_token_ids = self.uni_prompting.text_tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt"
+        ).to(device)
+        
+        attention_mask = (text_token_ids != self.uni_prompting.pad_id).long()
+        assert image_tokens.shape[0] == text_token_ids.shape[0]
+        
+        batch_size = image_tokens.shape[0]
+        # [task token] [soi] [image tokens] [eoi] [sot] [text tokens] [eot]
+        input_ids = torch.cat([
+            (torch.ones(batch_size, 1) * self.uni_prompting.sptids_dict['<|mmu|>']).to(device),
+            (torch.ones(batch_size, 1) * self.uni_prompting.sptids_dict['<|soi|>']).to(device),
+            image_tokens,
+            (torch.ones(batch_size, 1) * self.uni_prompting.sptids_dict['<|eoi|>']).to(device),
+            text_token_ids
+        ], dim=1).long()
+        
+        
+        
+        # output_ids = model.generate_text(
+        #     input_ids,
+        #     max_new_tokens=config.dataset.preprocessing.max_seq_length,
+        #     steps=max(1, config.dataset.preprocessing.max_seq_length // 2),
+        #     block_length=max(1, config.dataset.preprocessing.max_seq_length // 4),
+        # )
+        # generated_ids = output_ids[:, input_ids.shape[1]:]
+        # response_text = uni_prompting.text_tokenizer.batch_decode(
+        #     generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        # )[0]
+        # conversation_str = f"Image: {file_name}\n" + "=" * 20 + "\n"
+        # for msg in messages:
+        #     role_prefix = "User: " if msg.get('role') == 'user' else "Assistant: "
+        #     conversation_str += f"{role_prefix}{msg.get('content', '')}\n"
+        # conversation_str += f"Assistant (Generated): {response_text}\n"
+        # vis_img = torch.clamp((image.squeeze(0) + 1.0) / 2.0, min=0.0, max=1.0) * 255.0
+        # vis_img = vis_img.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+        return input_ids, attention_mask
+
+    def prepare_t2i(self, questions, image_paths):
+        image_tokens = torch.ones((len(questions), self.num_vq_tokens), dtype=torch.long, device="cpu") * mask_token_id
+        input_ids, attention_mask = self.uni_prompting((prompts, image_tokens), 't2i_gen')
+        if self.guidance_scale > 0:
+            uncond_input_ids, uncond_attention_mask = self.uni_prompting(([''] * len(questions), image_tokens), 't2i_gen')
+        else:
+            uncond_input_ids = None
+            uncond_attention_mask = None
+        mask_schedule = get_mask_schedule(self.mask_schedule)
+        #  with torch.no_grad():
+        #     gen_token_ids = model.generate_image(
+        #         input_ids=input_ids,
+        #         uncond_input_ids=uncond_input_ids,
+        #         attention_mask=attention_mask,
+        #         uncond_attention_mask=uncond_attention_mask,
+        #         guidance_scale=config.training.guidance_scale,
+        #         temperature=config.training.get("generation_temperature", 1.0),
+        #         timesteps=config.training.generation_timesteps,
+        #         noise_schedule=mask_schedule,
+        #         noise_type=config.training.get("noise_type", "mask"),
+        #         seq_len=config.model.mmada.num_vq_tokens,
+        #         uni_prompting=uni_prompting,
+        #         config=config,
+        #     )
+
+        # gen_token_ids = torch.clamp(gen_token_ids, max=config.model.mmada.codebook_size - 1, min=0)
+        # images = vq_model.decode_code(gen_token_ids)
+
+        # images = torch.clamp((images + 1.0) / 2.0, min=0.0, max=1.0)
+        # images *= 255.0
+        # images = images.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
+        # pil_images = [Image.fromarray(image) for image in images]
+        return input_ids, attention_mask, uncond_input_ids, uncond_attention_mask, mask_schedule
+    
+    def __call__(
+        self,
+        texts,
+        grounding_texts=None,
+        edit_texts=None,
+        images=None,
+        mode="text_gen",
+        **kwargs,
+    ):
+        answer_batch = self.prepare_mmu(texts, images)
+        if mode=="text_gen":
+            return answer_batch
+        else:
+            grounding_batch = self.prepare_mmu(
+                grounding_texts,
+                images,
+            )
+            grounding_batch = {f"{k}_grounding": v for k, v in grounding_batch.items()}
+            edit_batch = self.prepare_t2i(
+                edit_texts,
+                images,
+            )
+            return {**answer_batch, **grounding_batch, **edit_batch}
+        
+
+        
+class LavidaOProcessor(ProcessorMixin):
     attributes = []
     optional_attributes = []
 
@@ -84,6 +255,19 @@ class MyProcessor(ProcessorMixin):
             out.append(t)
         return torch.cat(out, dim=0)
 
+    def _right_pad_2d(self, tensors, pad_value, dtype_):
+        if len(tensors) == 0:
+            return torch.empty(0, 0, dtype=dtype_, device=self._get_device())
+        max_len = max(t.shape[1] for t in tensors)
+        out = []
+        for t in tensors:
+            pad_len = max_len - t.shape[1]
+            if pad_len > 0:
+                pad_t = torch.full((t.shape[0], pad_len), pad_value, dtype=dtype_, device=t.device)
+                t = torch.cat([t, pad_t], dim=1)
+            out.append(t)
+        return torch.cat(out, dim=0)
+
     def _left_pad_3d(self, tensors):
         if len(tensors) == 0:
             return torch.empty(0, 0, 0, dtype=torch.float32, device=self._get_device())
@@ -97,21 +281,10 @@ class MyProcessor(ProcessorMixin):
             out.append(t)
         return torch.cat(out, dim=0)
 
-    def prepare_text_only(self, text_batch):
-        device = self._get_device()
-        encoded = self.tokenizer(
-            text_batch,
-            return_tensors="pt",
-            padding=True,
-            add_special_tokens=False,
-        )
-        input_ids = encoded["input_ids"].to(device)
-        attention_mask = encoded["attention_mask"].to(device)
-        inputs_embeds = self.model.get_model().embed_tokens(input_ids)
+    def _detach_batch_tensors(self, batch):
         return {
-            "input_ids": input_ids,
-            "input_embeds": inputs_embeds,
-            "attention_mask": attention_mask,
+            key: value.detach() if torch.is_tensor(value) else value
+            for key, value in batch.items()
         }
 
     def prepare_text_with_images(self, text_batch, image_groups, include_bbox_mask=False):
@@ -163,7 +336,7 @@ class MyProcessor(ProcessorMixin):
         }
         if include_bbox_mask:
             out["bbox_mask"] = raw_input_ids == self.mask_id
-        return out
+        return self._detach_batch_tensors(out)
 
     def prepare_edit_generation_embeddings(self, edit_text_batch, image_batch, edit_mode, image_tokens=None, do_cfg=False):
         device = self._get_device()
@@ -285,7 +458,7 @@ class MyProcessor(ProcessorMixin):
         is_prompt = self._left_pad_2d(all_is_prompt, 0, torch.bool)
         is_gen_enc_null = torch.zeros_like(is_gen_enc, dtype=torch.bool)
 
-        return {
+        return self._detach_batch_tensors({
             "is_gen": is_gen,
             "is_gen_enc": is_gen_enc,
             "is_gen_enc_ccc": is_gen_enc_ccc,
@@ -297,7 +470,7 @@ class MyProcessor(ProcessorMixin):
             "inputs_embeds_uncond_enc": inputs_embeds_uncond_enc,
             "attention_mask_gen": attention_mask,
             "input_ids_gen": input_ids,
-        }
+        })
 
     def __call__(
         self,
@@ -310,25 +483,24 @@ class MyProcessor(ProcessorMixin):
         do_cfg=False,
         **kwargs,
     ):
-        if mode == "text_gen":
-            return self.prepare_text_only(texts)
-        elif mode == "image_gen":
-            assert grounding_texts is not None, "grounding_texts is required for image_gen mode"
-            assert edit_texts is not None, "edit_texts is required for image_gen mode"
+        answer_batch = self.prepare_text_with_images(
+            texts,
+            images,
+        )
+        if mode=="text_gen":
+            return answer_batch
+        else:
             grounding_batch = self.prepare_text_with_images(
                 grounding_texts,
                 images,
                 include_bbox_mask=True,
             )
+            grounding_batch = {f"{k}_grounding": v for k, v in grounding_batch.items()}
             edit_batch = self.prepare_edit_generation_embeddings(
                 edit_texts,
                 images,
                 edit_mode=edit_mode,
                 do_cfg=do_cfg,
             )
-            return {**grounding_batch, **edit_batch}
-        elif mode == "grounding":
-            assert texts is not None, "texts is required for grounding mode"
-            return self.prepare_text_with_images(grounding_texts, images, include_bbox_mask=True)
-        else:
-            raise ValueError(f"Invalid mode: {mode}")
+            return {**answer_batch, **grounding_batch, **edit_batch}
+        

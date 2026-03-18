@@ -760,13 +760,36 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                             " those weights or else make sure your checkpoint file is correct."
                         )
 
-                    unexpected_keys = load_model_dict_into_meta(
+                    # Compatibility across diffusers versions:
+                    # older `load_model_dict_into_meta` implementations do not accept
+                    # some kwargs (e.g. `device`), so only pass supported kwargs.
+                    _meta_load_kwargs = {
+                        "device": param_device,
+                        "dtype": torch_dtype,
+                        "model_name_or_path": pretrained_model_name_or_path,
+                    }
+                    _meta_sig = inspect.signature(load_model_dict_into_meta)
+                    _meta_load_kwargs = {
+                        k: v for k, v in _meta_load_kwargs.items() if k in _meta_sig.parameters
+                    }
+                    expected_keys = set(model.state_dict().keys())
+                    unexpected_keys = [k for k in state_dict.keys() if k not in expected_keys]
+                    if "unexpected_keys" in _meta_sig.parameters:
+                        _meta_load_kwargs["unexpected_keys"] = unexpected_keys
+
+                    meta_load_result = load_model_dict_into_meta(
                         model,
                         state_dict,
-                        device=param_device,
-                        dtype=torch_dtype,
-                        model_name_or_path=pretrained_model_name_or_path,
+                        **_meta_load_kwargs,
                     )
+
+                    # Compatibility across diffusers versions:
+                    # - older versions returned `unexpected_keys` directly
+                    # - newer versions return bookkeeping tuples (e.g. offload indexes)
+                    if isinstance(meta_load_result, list):
+                        unexpected_keys = meta_load_result
+
+                    unexpected_keys = [k for k in unexpected_keys if isinstance(k, str)]
 
                     if cls._keys_to_ignore_on_load_unexpected is not None:
                         for pat in cls._keys_to_ignore_on_load_unexpected:
@@ -774,7 +797,8 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
 
                     if len(unexpected_keys) > 0:
                         logger.warning(
-                            f"Some weights of the model checkpoint were not used when initializing {cls.__name__}: \n {[', '.join(unexpected_keys)]}"
+                            f"Some weights of the model checkpoint were not used when initializing {cls.__name__}:"
+                            f"\n {', '.join(unexpected_keys)}"
                         )
 
                 else:  # else let accelerate handle loading and dispatching.

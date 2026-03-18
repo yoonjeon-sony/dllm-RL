@@ -177,8 +177,8 @@ GROUNDING_PROMPT = (
 EDIT_PROMPT = (
     "Edit the region where auxiliary line, box, or drawing could help solve the following problem."
 )
-'''Generation Instructions: You should first think about the reasoning process in the mind and then provide the user with the answer. 
-The reasoning process is enclosed within <think> </think> tags, i.e. <think> reasoning process here </think> answer here'''
+# '''Generation Instructions: You should first think about the reasoning process in the mind and then provide the user with the answer. 
+# The reasoning process is enclosed within <think> </think> tags, i.e. <think> reasoning process here </think> answer here'''
 
 INTERLEAVE_PROMPT = (
     "Let's think step-by-step to solve the question."
@@ -238,6 +238,7 @@ def get_thinkmorph_image_editing_questions(
     data_root: str | None = None,
     image_root: str | None = None,
     gen_type: str = "image_gen",
+    per_task_sample = None,
 ) -> Dataset:
     if split != "train":
         raise ValueError(f"Unsupported split '{split}' for ThinkMorph. Use 'train'.")
@@ -247,7 +248,7 @@ def get_thinkmorph_image_editing_questions(
     rows: list[dict] = []
     for config_name in THINKMORPH_HF_CONFIGS:
         data = load_dataset(THINKMORPH_HF_REPO_ID, config_name, split=split)
-        for example in data:
+        for idx, example in enumerate(data):
             gt_bbox = _parse_bbox(example.get("raw_gt_box"))
             if gen_type in {"grounding", "image_gen"} and gt_bbox is None:
                 continue
@@ -255,40 +256,17 @@ def get_thinkmorph_image_editing_questions(
             question = example["question"]
             rows.append(
                 {
-                    "prompt": _build_question_prompt(question),
+                    "answer_prompt": _build_question_prompt(question),
                     "edit_prompt": f"{EDIT_PROMPT} {question}",
                     "grounding_prompt": _build_grounding_prompt(question),
-                    "answer": example["answer"],
-                    "gt_bbox": gt_bbox,  # (x, y, x, y) in original image scale / left top & right bottom coords
+                    "answer_gt": example["answer"],
+                    "grounding_gt": gt_bbox,  # (x, y, x, y) in original image scale / left top & right bottom coords
                     "image": _decode_dataset_image(example["problem_image_0"]),
                     "gen_type": gen_type,
+                    "task_type": config_name,
                 }
             )
+            if per_task_sample is not None and idx >= per_task_sample:
+                break
 
     return Dataset.from_list(rows)
-
-
-def get_thinkmorph_questions(
-    split: str = "train",
-    data_root: str | None = None,
-    image_root: str | None = None,
-) -> Dataset:
-    return get_thinkmorph_image_editing_questions(
-        split=split,
-        data_root=data_root,
-        image_root=image_root,
-        gen_type="text_gen",
-    )
-
-
-def get_thinkmorph_grounding_questions(
-    split: str = "train",
-    data_root: str | None = None,
-    image_root: str | None = None,
-) -> Dataset:
-    return get_thinkmorph_image_editing_questions(
-        split=split,
-        data_root=data_root,
-        image_root=image_root,
-        gen_type="grounding",
-    )

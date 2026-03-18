@@ -217,8 +217,13 @@ def get_logits(model, input_emnbeddings, modality_indices=None, t2i_inference=Fa
         logits = final_logits
         return logits
     else:
-        modality_indices = torch.zeros(input_emnbeddings.shape[:-1],device=input_emnbeddings.device,dtype=torch.bool)
-        logits = model(None,input_embeddings=input_emnbeddings,modality_indices=modality_indices,past_key_values=past_key_values).logits
+        # Text-only scoring should not activate the dual-tower modality path.
+        logits = model(
+            None,
+            input_embeddings=input_emnbeddings,
+            modality_indices=None,
+            past_key_values=past_key_values,
+        ).logits
     return logits
 
 def wte(model,x,t2i_inference=False,gen_shape=None,x_gen=None,inputs_embeds_curr=None,new_token_mask=None):

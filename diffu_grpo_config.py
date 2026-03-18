@@ -316,6 +316,14 @@ class DiffuGRPOConfig(GRPOConfig):
         default=0.2,
         metadata={"help": "Epsilon value for clipping."},
     )
+    epsilon_low: float = field(
+        default=0.2,
+        metadata={"help": "Lower clipping epsilon used for the floor `1 - epsilon_low`."},
+    )
+    epsilon_high: float = field(
+        default=0.2,
+        metadata={"help": "Upper clipping epsilon used for the ceiling `1 + epsilon_high`."},
+    )
     reward_weights: Optional[list[float]] = field(
         default=None,
         metadata={

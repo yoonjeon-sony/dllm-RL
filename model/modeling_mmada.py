@@ -115,7 +115,7 @@ class MMadaModelLM(LLaDAModelLM):
         # self.resize_token_embeddings(config.new_vocab_size)
 
     @torch.no_grad()
-    def t2i_generate(
+    def generate_image(
             self,
             input_ids: torch.LongTensor = None,
             uncond_input_ids: torch.LongTensor = None,
@@ -374,7 +374,7 @@ class MMadaModelLM(LLaDAModelLM):
 
 
     @torch.no_grad()
-    def mmu_generate(self, idx=None, input_embeddings=None, max_new_tokens=128, steps=128,block_length=128, temperature=0.0, top_k=None, eot_token=None, cfg_scale=0.0, remasking='low_confidence', mask_id=126336, attention_mask=None):
+    def generate_text(self, idx=None, input_embeddings=None, max_new_tokens=128, steps=128,block_length=128, temperature=0.0, top_k=None, eot_token=None, cfg_scale=0.0, remasking='low_confidence', mask_id=126336, attention_mask=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.

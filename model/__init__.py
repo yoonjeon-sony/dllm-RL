@@ -9,7 +9,7 @@
 # Dissemination of this information or reproduction of this material
 # is strictly forbidden unless prior written permission is obtained
 # from Adobe.
-from .modeling_magvitv2 import VQGANEncoder, VQGANDecoder, LFQuantizer, MAGVITv2
+# from llava.model.multimodal_encoder.magvit2 import VQGANEncoder, VQGANDecoder, LFQuantizer, MAGVITv2
 from .sampling import *
 from .modeling_mmada import MMadaModelLM, MMadaConfig
 import os
