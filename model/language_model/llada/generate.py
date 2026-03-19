@@ -188,7 +188,7 @@ INT_MAX = 1_000_000
 def get_logits(model, input_emnbeddings, modality_indices=None, t2i_inference=False, past_key_values=None,gen_shape=None,timesteps=None,input_modality_indices=None):
     if t2i_inference:
         if input_modality_indices is None:
-            input_modality_indices =modality_indices
+            input_modality_indices = modality_indices
         output = model(
             None,
             input_embeddings=input_emnbeddings,

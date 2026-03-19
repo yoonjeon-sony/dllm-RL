@@ -262,6 +262,7 @@ def get_thinkmorph_image_editing_questions(
                     "answer_gt": example["answer"],
                     "grounding_gt": gt_bbox,  # (x, y, x, y) in original image scale / left top & right bottom coords
                     "image": _decode_dataset_image(example["problem_image_0"]),
+                    "image_gt": _decode_dataset_image(example["reasoning_image_0"]),
                     "gen_type": gen_type,
                     "task_type": config_name,
                 }

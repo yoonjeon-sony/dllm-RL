@@ -10,33 +10,20 @@ from trl import TrlParser, ModelConfig
 import warnings
 
 # Custom imports
-from diffu_grpo_trainer import DiffuGRPOTrainer # for LaViDa-O
+from grpo_trainer import DiffuGRPOTrainer # for LaViDa-O
 from mmada_grpo_trainer import MMADAGRPOTrainer # for MMADA
-from diffu_grpo_config import DiffuGRPOConfig
+from grpo_config import DiffuGRPOConfig
 from transformers import AutoTokenizer
 from llava.model.modeling_mmada import MMadaModelLM
 from reward_func import (
-    xmlcount_reward_func,
-    soft_format_reward_func,
-    strict_format_reward_func,
-    int_reward_func,
     correctness_reward_func,
-    countdown_reward_func,
-    correctness_reward_func_math,
-    sudoku_reward_func,
     boxed_and_answer_tags_format_reward,
-    reward_len,
-    coding_reward_func,
     correct_grounding_reward_func,
+    perceptual_score_reward_func
 )
 from data_utils import (
-    get_gsm8k_questions,
-    get_countdown_questions,
-    get_sudoku_questions,
-    set_random_seed,
-    get_math_questions,
-    get_code_questions,
     get_thinkmorph_image_editing_questions,
+    set_random_seed,
 )
 
 from llava.model.builder import load_pretrained_model
@@ -101,33 +88,8 @@ def main(grpo_config, model_config):
     dataset_name = (grpo_config.dataset or "").replace("-", "_").rstrip(":")
 
     # Load dataset based on configuration
-    if dataset_name == "gsm8k":
-        dataset = get_gsm8k_questions("train")
-        reward_functions = [
-            xmlcount_reward_func,
-            soft_format_reward_func,
-            strict_format_reward_func,
-            int_reward_func,
-            correctness_reward_func,
-        ]
-    elif dataset_name == "countdown":
-        dataset = get_countdown_questions("train")
-        reward_functions = [countdown_reward_func]
-    elif dataset_name == "sudoku":
-        dataset = get_sudoku_questions()
-        reward_functions = [sudoku_reward_func]
-    elif dataset_name == "math":
-        dataset = get_math_questions("train")
-        reward_functions = [
-            correctness_reward_func_math,
-            boxed_and_answer_tags_format_reward,
-        ]
 
-    elif dataset_name == "code":
-        dataset = get_code_questions()
-        reward_functions = [xmlcount_reward_func, coding_reward_func]
-    
-    elif dataset_name == "thinkmorph":
+    if dataset_name == "thinkmorph":
         gen_type = "text_gen"
         dataset = get_thinkmorph_image_editing_questions(
             data_root=grpo_config.data_root,
@@ -150,6 +112,7 @@ def main(grpo_config, model_config):
             boxed_and_answer_tags_format_reward,
             correct_grounding_reward_func,
             correctness_reward_func,
+            perceptual_score_reward_func,
         ]
     else:
         raise ValueError(f"Unsupported dataset '{grpo_config.dataset}'.")
