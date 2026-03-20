@@ -10,9 +10,8 @@ from pathlib import Path
 
 from aiohttp import web
 
-BASE_DIR = Path(__file__).resolve().parent
-LOG_DIR = BASE_DIR.parent / "slurm-logs"
-TEMPLATE_DIR = BASE_DIR / "templates"
+LOG_DIR = Path("/home/yoonjeon.kim/dLLM-RL/train_sft/slurm-logs")
+TEMPLATE_DIR = Path("/home/yoonjeon.kim/dLLM-RL/train_sft/slurm_monitor/templates")
 
 
 # ---------------------------------------------------------------------------

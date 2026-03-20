@@ -316,8 +316,8 @@ class DiffuGRPOTrainer(GRPOTrainer):
                     raise NotImplementedError("KL divergence not implemented for multi-modal training")
                 
         # pad and concat  
-        per_token_logps = self._pad_and_concat(all_per_token_logps, pad_dim=2, cat_dim=1, pad_value=0.0) # (1, bsz, completion_seq_len)
-        old_per_token_logps = self._pad_and_concat(all_old_per_token_logps, pad_dim=2, cat_dim=1, pad_value=0.0)[this_itr_idx] # (num_iter, bsz, completion_seq_len)
+        per_token_logps = self._pad_and_concat(all_per_token_logps, pad_dim=2, cat_dim=1, pad_value=0.0)[0] # (bsz, completion_seq_len)
+        old_per_token_logps = self._pad_and_concat(all_old_per_token_logps, pad_dim=2, cat_dim=1, pad_value=0.0)[this_itr_idx] # (bsz, completion_seq_len)
         advantages = torch.cat(all_advantages, dim=0) # bsz
         completion_mask = self._pad_and_concat(all_completion_masks, pad_dim=1, cat_dim=0, pad_value=0.0) # bsz, completion_seq_len
         coef_1 = torch.exp(per_token_logps - old_per_token_logps)
@@ -349,19 +349,17 @@ class DiffuGRPOTrainer(GRPOTrainer):
     def forward_process(
         self,
         batch: torch.Tensor,
-        prompt_index: torch.Tensor,
         mask_id: int,
         seed: Optional[Union[int, torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Corrupt prompt / completion tokens for diffusion log-prob evaluation.
+        Corrupt completion tokens for diffusion log-prob evaluation.
 
         batch:        (bsz, seq_len)
         prompt_index: (bsz, seq_len) bool; True only on prompt positions
 
         returns:
             noisy_batch: (bsz, seq_len)
-            p_mask:      (bsz, seq_len)
         """
         assert batch.dim() == 2, f"Batch must be 2D, got {batch.dim()}D but got {batch.size()}"
         if isinstance(seed, torch.Tensor):
@@ -376,14 +374,10 @@ class DiffuGRPOTrainer(GRPOTrainer):
         t_p = torch.ones(bsz, device=batch.device) * self.args.p_mask_prompt  # (bsz,)
         random_matrix = torch.rand((bsz, seq_len), device=batch.device, generator=generator)  # (bsz, seq_len)
 
-        is_mask_prompt = prompt_index & (random_matrix < t_p.unsqueeze(1))  # (bsz, seq_len)
-        is_mask_completion = ~prompt_index  # (bsz, seq_len)
-        is_mask = is_mask_prompt | is_mask_completion  # (bsz, seq_len)
-
+        is_mask = (random_matrix < t_p.unsqueeze(1))  # (bsz, seq_len)
         noisy_batch = torch.where(is_mask, mask_id, batch)  # (bsz, seq_len)
-        p_mask = torch.where(prompt_index, t_p.unsqueeze(1), torch.ones_like(t_p).unsqueeze(1))  # (bsz, seq_len)
 
-        return noisy_batch, p_mask
+        return noisy_batch
 
     def _get_text_completion_mask(self, completion_ids: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         """
@@ -506,7 +500,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
         """
         Compute text per-token log-probs following the model's native generate_text-style forward path.
 
-        input_ids:           (num_iter, bsz, full_seq_len) = [prompt tokens | completion tokens]
+        input_ids:           (num_iter, bsz, completion_tokens) = [completion tokens]
         prompt_input_embeds: (num_iter, bsz, prompt_seq_len, hidden_dim)
         logits_to_keep:      scalar = completion_seq_len
 
@@ -514,22 +508,25 @@ class DiffuGRPOTrainer(GRPOTrainer):
             per_token_logps: (num_iter, bsz, completion_seq_len)
         """
         num_iterations, batch_size, seq_len = input_ids.size()
-        prompt_length = seq_len - logits_to_keep
+        
         assert len(mask_seeds) == num_iterations, f"Expected mask_seeds length to be {num_iterations}, got {len(mask_seeds)}"
         core_model = model.get_model() if hasattr(model, "get_model") else model
 
         past_key_values = None
-        if prompt_length > 0:
-            with torch.no_grad():
-                past_key_values = core_model(
-                    None,
-                    input_embeddings=prompt_input_embeds,
-                    use_cache=True,
-                    modality_indices=None,
-                ).attn_key_values
-
-        prompt_index = torch.zeros(seq_len, dtype=torch.bool, device=input_ids.device)  # (bsz, full_seq_len)
-        prompt_index[:prompt_length] = True  # Mark prompt tokens as True
+        
+        with torch.no_grad():
+            prompt_input_embeds_flat = prompt_input_embeds.reshape(
+                num_iterations * batch_size,
+                prompt_input_embeds.size(-2),
+                prompt_input_embeds.size(-1),
+            )
+            past_key_values = core_model(
+                None,
+                input_embeddings=prompt_input_embeds_flat,
+                use_cache=True,
+                modality_indices=None,
+            ).attn_key_values
+            
         
         all_perturbed_seqs = []
         all_expanded_inputs = []
@@ -537,19 +534,18 @@ class DiffuGRPOTrainer(GRPOTrainer):
             x = input_ids[iter_idx].clone()  # (bsz, full_seq_len)
             all_expanded_inputs.append(x)
 
-            perturbed_seq, _ = self.forward_process(
+            perturbed_seq = self.forward_process(
                 batch=x,
-                prompt_index=prompt_index,
                 mask_id=self.args.mask_id,
                 seed=mask_seed,
-            )  # -> (bsz, full_seq_len)
+            )  # -> (bsz, completion_tokens)
 
             all_perturbed_seqs.append(perturbed_seq)
 
         perturbed_seq = torch.cat(all_perturbed_seqs, dim=0)  # (num_iterations * bsz, full_seq_len)
         expanded_input = torch.cat(all_expanded_inputs, dim=0)  # (num_iterations * bsz, full_seq_len)
 
-        completion_seq = perturbed_seq[:, prompt_length:]  # (num_iterations * bsz, completion_seq_len)
+        completion_seq = perturbed_seq  # (num_iterations * bsz, completion_seq_len)
 
         inputs_embeds_curr, new_token_mask = llada_wte(
             core_model,
@@ -635,9 +631,8 @@ class DiffuGRPOTrainer(GRPOTrainer):
         all_expanded_inputs = []
         for iter_idx, mask_seed in enumerate(mask_seeds):
             x = image_completion_ids[iter_idx].clone()  # (bsz_image, image_token_len)
-            perturbed_seq, _ = self.forward_process(
+            perturbed_seq = self.forward_process(
                 batch=x,
-                prompt_index=prompt_index,
                 mask_id=img_mask_id,
                 seed=mask_seed,
             )  # -> (num_iter, bsz, image_token_len)
@@ -649,14 +644,20 @@ class DiffuGRPOTrainer(GRPOTrainer):
         mask_idx = perturbed_seq == img_mask_id
         n_mask_per_sample = mask_idx.sum(dim=1)
         timesteps = n_mask_per_sample.float() / mask_idx.shape[1]
+        image_input_embeds_gen_flat = image_input_embeds_gen.reshape(
+            num_iterations * batch_size,
+            image_input_embeds_gen.size(-2),
+            image_input_embeds_gen.size(-1),
+        )
+        image_is_gen_flat = image_is_gen.reshape(-1, image_is_gen.size(-1))
         all_input_embeddings, new_token_mask = llada_wte(
             model,
             None,
             True,
             x_gen=perturbed_seq,
             gen_shape=image_gen_shape,
-            inputs_embeds_curr=image_input_embeds_gen,
-            new_token_mask=image_is_gen,
+            inputs_embeds_curr=image_input_embeds_gen_flat,
+            new_token_mask=image_is_gen_flat,
         )
         enc_use_image_branch = getattr(model.config, "enc_use_image_branch", False)
         if enc_use_image_branch:
@@ -671,7 +672,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
             new_token_mask,
             True,
             gen_shape=image_gen_shape,
-            input_modality_indices=modality_indices,
+            input_modality_indices=modality_indices.reshape(-1, modality_indices.size(-1)),
             timesteps=timesteps,
         ) # num_iterations * bsz_image, image_token_len, vocab_size
         completion_targets = expanded_input[:, -logits_to_keep:]  # (num_iterations * bsz_image, completion_seq_len)
@@ -858,7 +859,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
             if ground_completion_ids is not None
             else (None, None, None)
         ) # (bsz_ground, ground_completion_seq_len)
-        image_completion_mask, image_completion_ids_list, image_completion_lengths = (
+        image_completion_mask = (
             self._get_image_completion_mask(image_completion_ids, edit_region_mask)
             if image_completion_ids is not None
             else (None, None, None)
@@ -878,24 +879,23 @@ class DiffuGRPOTrainer(GRPOTrainer):
         old_image_per_token_logps = None
 
         with torch.no_grad():
-            answer_prompt_ids_expanded = answer_prompt_ids.unsqueeze(0).expand(self.num_iterations, -1, -1)
+            answer_completion_ids_expanded = answer_completion_ids.unsqueeze(0).expand(self.num_iterations, -1, -1)
             answer_prompt_input_embeds_expanded = answer_prompt_input_embeds.unsqueeze(0).expand(self.num_iterations, -1, -1, -1)
             # TODO: Add attention mask to per_token_logps
             answer_old_text_per_token_logps = self._get_text_per_token_logps(
                 model=unwrapped_model.get_model(),
-                input_ids=answer_prompt_ids_expanded,
-                
+                input_ids=answer_completion_ids_expanded,
                 prompt_input_embeds=answer_prompt_input_embeds_expanded,
                 logits_to_keep=answer_completion_ids.size(1),
                 mask_seeds=mask_seeds.tolist(),
             )  # (num_iter, bsz, answer_completion_seq_len)
 
             if ground_completion_ids is not None:
-                ground_prompt_ids_expanded = ground_prompt_ids.unsqueeze(0).expand(self.num_iterations, -1, -1)
+                ground_completion_ids_expanded = ground_completion_ids.unsqueeze(0).expand(self.num_iterations, -1, -1)
                 ground_prompt_input_embeds_expanded = ground_prompt_input_embeds.unsqueeze(0).expand(self.num_iterations, -1, -1, -1)
                 ground_old_text_per_token_logps = self._get_text_per_token_logps(
                     model=unwrapped_model.get_model(),
-                    input_ids=ground_prompt_ids_expanded,
+                    input_ids=ground_completion_ids_expanded,
                     prompt_input_embeds=ground_prompt_input_embeds_expanded,
                     logits_to_keep=ground_completion_ids.size(1),
                     mask_seeds=mask_seeds.tolist(),
@@ -949,16 +949,19 @@ class DiffuGRPOTrainer(GRPOTrainer):
         ]
         
         modality_dict_list = [
-            {"prompt_ids": answer_prompt_ids, "prompt_mask": answer_prompt_mask, "prompt_input_embeds": answer_prompt_input_embeds, "completion_ids": answer_completion_ids, "completion_mask": answer_completion_mask, "mask_seeds": mask_seeds, "old_per_token_logps": answer_old_text_per_token_logps, "ref_per_token_logps": None, "completion_ids_list": answer_completion_ids_list, "completion_lengths": answer_completion_lengths},
-            {"prompt_ids": ground_prompt_ids, "prompt_mask": ground_prompt_mask, "prompt_input_embeds": ground_prompt_input_embeds, "completion_ids": ground_completion_ids, "completion_mask": ground_completion_mask, "mask_seeds": mask_seeds, "old_per_token_logps": ground_old_text_per_token_logps, "ref_per_token_logps": None, "completion_ids_list": ground_completion_ids_list, "completion_lengths": ground_completion_lengths},
-            {"prompt_ids": image_prompt_ids, "prompt_mask": image_prompt_mask, "prompt_input_embeds": image_prompt_input_embeds, "is_gen": image_is_gen, "is_gen_enc": image_is_gen_enc, "completion_ids": image_completion_ids, "completion_mask": image_completion_mask, "mask_seeds": mask_seeds, "old_per_token_logps": old_image_per_token_logps, "ref_per_token_logps": None, "completion_ids_list": image_completion_ids_list, "completion_lengths": image_completion_lengths},
+            {"prompts": answer_prompts, "completions": answer_completions, "completion_ids": answer_completion_ids, "prompt_ids": answer_prompt_ids, "prompt_mask": answer_prompt_mask, "prompt_input_embeds": answer_prompt_input_embeds, "completion_mask": answer_completion_mask, "mask_seeds": mask_seeds, "old_per_token_logps": answer_old_text_per_token_logps, "ref_per_token_logps": None, "completion_ids_list": answer_completion_ids_list, "completion_lengths": answer_completion_lengths},
+            {"prompts": grounding_prompts, "completions": grounding_completions, "completion_ids": ground_completion_ids, prompt_ids": ground_prompt_ids, "prompt_mask": ground_prompt_mask, "prompt_input_embeds": ground_prompt_input_embeds, "completion_ids": ground_completion_ids, "completion_mask": ground_completion_mask, "mask_seeds": mask_seeds, "old_per_token_logps": ground_old_text_per_token_logps, "ref_per_token_logps": None, "completion_ids_list": ground_completion_ids_list, "completion_lengths": ground_completion_lengths},
+            {"prompts": image_prompts, "completions": image_completions, "completion_ids": image_completion_ids, "prompt_ids": image_prompt_ids, "prompt_mask": image_prompt_mask, "prompt_input_embeds": image_prompt_input_embeds, "is_gen": image_is_gen, "is_gen_enc": image_is_gen_enc, "completion_ids": image_completion_ids, "completion_mask": image_completion_mask, "mask_seeds": mask_seeds, "old_per_token_logps": old_image_per_token_logps, "ref_per_token_logps": None},
         ]
-        for modality, prompts, completions, completion_ids, reward_fnc, reward_weight, modality_dict in zip(modalities, [answer_prompts, ground_prompts, image_prompts], [answer_completions, ground_completions, image_completions], [answer_completion_ids, ground_completion_ids, image_completion_ids], reward_fncs, reward_weights_list, modality_dict_list):
+        for modality, reward_fnc, reward_weight, modality_dict in zip(modalities, reward_fncs, reward_weights_list, modality_dict_list):
             if completion_ids is not None:
                 self.reward_funcs = list(reward_fnc.values())
                 self.reward_func_names = list(reward_fnc.keys())
                 keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
                 assert f"{modality}_gt" in keys, f"Expected {modality}_gt to be in keys, got {keys} only"
+                prompts = modality_dict_list["prompts"]
+                completions = modality_dict_list["completions"]
+                completion_ids = modality_dict_list["completion_ids"]
                 rewards_per_func = self._calculate_rewards(inputs, prompts, completions, completion_ids)
                 # Apply weights to each reward function's output and sum
                 rewards = (rewards_per_func * torch.tensor(reward_weight).to(device).unsqueeze(0)).nansum(dim=1)
@@ -988,22 +991,23 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 self._metrics[mode][f"{modality}_num_tokens"] = [self.state.num_input_tokens_seen]
 
                 # Log completion lengths, mean, min, max
-                agg_completion_lengths = self.accelerator.gather(modality_dict["completion_lengths"])
+                agg_completion_lengths = self.accelerator.gather(modality_dict.get("completion_lengths", 0))
                 self._metrics[mode][f"{modality}_completions/mean_length"].append(agg_completion_lengths.float().mean().item())
                 self._metrics[mode][f"{modality}_completions/min_length"].append(agg_completion_lengths.float().min().item())
                 self._metrics[mode][f"{modality}_completions/max_length"].append(agg_completion_lengths.float().max().item())
 
                 # Identify sequences that terminated with EOS and log their lengths
-                is_eos = modality_dict["completion_ids"] == self.processing_class.tokenizer.eos_token_id  # (bsz, completion_seq_len)
-                agg_terminated_with_eos = self.accelerator.gather(is_eos.any(dim=1))
-                term_completion_lengths = agg_completion_lengths[agg_terminated_with_eos]
-                clipped_completions_ratio = 1 - len(term_completion_lengths) / len(agg_completion_lengths)
-                self._metrics[mode][f"{modality}_completions/clipped_ratio"].append(clipped_completions_ratio)
-                if len(term_completion_lengths) == 0:  # edge case where no terminated sequences are found
-                    term_completion_lengths = torch.zeros(1, device=device)
-                self._metrics[mode][f"{modality}_completions/mean_terminated_length"].append(term_completion_lengths.float().mean().item())
-                self._metrics[mode][f"{modality}_completions/min_terminated_length"].append(term_completion_lengths.float().min().item())
-                self._metrics[mode][f"{modality}_completions/max_terminated_length"].append(term_completion_lengths.float().max().item())
+                if modality in ["answer", "ground"]:
+                    is_eos = modality_dict["completion_ids"] == self.processing_class.tokenizer.eos_token_id  # (bsz, completion_seq_len)
+                    agg_terminated_with_eos = self.accelerator.gather(is_eos.any(dim=1))
+                    term_completion_lengths = agg_completion_lengths[agg_terminated_with_eos]
+                    clipped_completions_ratio = 1 - len(term_completion_lengths) / len(agg_completion_lengths)
+                    self._metrics[mode][f"{modality}_completions/clipped_ratio"].append(clipped_completions_ratio)
+                    if len(term_completion_lengths) == 0:  # edge case where no terminated sequences are found
+                        term_completion_lengths = torch.zeros(1, device=device)
+                    self._metrics[mode][f"{modality}_completions/mean_terminated_length"].append(term_completion_lengths.float().mean().item())
+                    self._metrics[mode][f"{modality}_completions/min_terminated_length"].append(term_completion_lengths.float().min().item())
+                    self._metrics[mode][f"{modality}_completions/max_terminated_length"].append(term_completion_lengths.float().max().item())
 
                 # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
                 for i, reward_func_name in enumerate(self.reward_func_names):
@@ -1014,11 +1018,11 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 self._metrics[mode][f"{modality}_reward"].append(mean_grouped_rewards.mean().item())
                 self._metrics[mode][f"{modality}_reward_std"].append(std_grouped_rewards.mean().item())
                 self._metrics[mode][f"{modality}_frac_reward_zero_std"].append(is_std_zero.float().mean().item())
-                self._logs["prompt"].extend(gather_object(prompts))
-                self._logs["completion"].extend(gather_object(completions))
+                # self._logs[f"{modality}_prompt"].extend(gather_object(prompts))
+                # self._logs[f"{modality}_completion"].extend(gather_object(completions))
                 for i, name in enumerate(self.reward_func_names):
-                    self._logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
-                self._logs["advantages"].extend(all_process_advantages.tolist())
+                    self._logs[f"{modality}_rewards"][name].extend(rewards_per_func[:, i].tolist())
+                self._logs[f"{modality}_advantages"].extend(all_process_advantages.tolist())
 
 
                 all_outputs[f"{modality}_prompt_ids"] = modality_dict["prompt_ids"] # bsz, prompt_seq_len
@@ -1026,7 +1030,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 all_outputs[f"{modality}_completion_ids"] = modality_dict["completion_ids"] # bsz, completion_seq_len
                 all_outputs[f"{modality}_completion_mask"] = modality_dict["completion_mask"] # bsz, completion_seq_len
                 all_outputs[f"{modality}_prompt_input_embeds"] = modality_dict["prompt_input_embeds"] # bsz, prompt_seq_len, hidden_dim
-                    
+                
                 if modality in ["image"]:
                     all_outputs["is_gen"] = modality_dict["is_gen"] # bsz, seq_len_model
                     all_outputs["is_gen_enc"] = modality_dict["is_gen_enc"] # bsz, seq_len_model
@@ -1041,4 +1045,3 @@ class DiffuGRPOTrainer(GRPOTrainer):
             else:
                 continue
         return all_outputs
-        

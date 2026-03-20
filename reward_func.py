@@ -525,7 +525,7 @@ def correctness_reward_func(prompts, completions, answer_gt, step=None, run_name
     )
     return [1.0 if r == a else 0.0 for r, a in zip(extracted_responses, answer_gt)]
 
-def correct_grounding_reward_func(prompts, completions, grounding_gt, step=None, run_name=None, **kwargs) -> list[float]:
+def correct_grounding_reward_func(prompts, completions, ground_gt, step=None, run_name=None, **kwargs) -> list[float]:
     def _pairwise_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
         """
         Compute pairwise IoU between two tensors of shape (4,) in xyxy format.
@@ -552,7 +552,7 @@ def correct_grounding_reward_func(prompts, completions, grounding_gt, step=None,
 
     box = [[int(y) for y in re.compile('<LOC_([0-9]+)>').findall(x)] for x in completions]
     rewards = []
-    for pred_box, gt_box in zip(box, grounding_gt):
+    for pred_box, gt_box in zip(box, ground_gt):
         if len(pred_box) == 4:
             rewards.append(_pairwise_iou(
                 torch.tensor(pred_box, dtype=torch.float32),
@@ -571,7 +571,7 @@ def correct_grounding_reward_func(prompts, completions, grounding_gt, step=None,
         "-" * 20,
         f"\n{RED}Prompt:{RESET}\n{prompts[0]}\n",
         "-" * 20,
-        f"\n{GREEN}Ground Truth:{RESET}\n{grounding_gt[0]}\n",
+        f"\n{GREEN}Ground Truth:{RESET}\n{ground_gt[0]}\n",
         "-" * 20,
         f"\n{BLUE}Response:{RESET}\n{box[0]}\n",
         "-" * 20,
@@ -580,7 +580,7 @@ def correct_grounding_reward_func(prompts, completions, grounding_gt, step=None,
     return rewards
 
 
-def perceptual_score_reward_func(prompts, image_completions, image_gt, step=None, run_name=None, **kwargs) -> list[float]:
+def perceptual_score_reward_func(prompts, completions, image_gt, step=None, run_name=None, **kwargs) -> list[float]:
     """
     Computes perceptual similarity score between generated image and ground truth image.
     Higher is better.

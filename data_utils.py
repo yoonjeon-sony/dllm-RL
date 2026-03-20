@@ -260,7 +260,7 @@ def get_thinkmorph_image_editing_questions(
                     "edit_prompt": f"{EDIT_PROMPT} {question}",
                     "grounding_prompt": _build_grounding_prompt(question),
                     "answer_gt": example["answer"],
-                    "grounding_gt": gt_bbox,  # (x, y, x, y) in original image scale / left top & right bottom coords
+                    "ground_gt": gt_bbox,  # (x, y, x, y) in original image scale / left top & right bottom coords
                     "image": _decode_dataset_image(example["problem_image_0"]),
                     "image_gt": _decode_dataset_image(example["reasoning_image_0"]),
                     "gen_type": gen_type,
