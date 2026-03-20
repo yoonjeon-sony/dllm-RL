@@ -20,7 +20,7 @@ from tqdm import tqdm
 import time
 import random
 import re
-
+from llava.mm_utils import pad_to_square_and_resize
 
 # Reward functions
 def boxed_in_answer(prompts, completions, step=None, **kwargs):
@@ -588,12 +588,44 @@ def perceptual_score_reward_func(prompts, completions, image_gt, step=None, run_
     import lpips
     loss_fn = lpips.LPIPS(net='vgg')  # perceptual similarity
 
+    def _to_tensor(img):
+        """
+        Convert PIL / numpy / tensor → torch.Tensor [C, H, W]
+        """
+        from PIL import Image
+        import numpy as np
+
+        if isinstance(img, Image.Image):
+            img = torch.from_numpy(np.array(img))  # [H, W, C]
+
+        if isinstance(img, np.ndarray):
+            img = torch.from_numpy(img)
+
+        if isinstance(img, torch.Tensor):
+            # Ensure float
+            img = img.float()
+
+            # If [H, W, C] → [C, H, W]
+            if img.ndim == 3 and img.shape[-1] in [1, 3]:
+                img = img.permute(2, 0, 1)
+
+            # If grayscale [H, W] → [1, H, W]
+            if img.ndim == 2:
+                img = img.unsqueeze(0)
+
+            return img
+
+        raise TypeError(f"Unsupported image type: {type(img)}")
+
     def _normalize(img: torch.Tensor):
         """
         Normalize image to [-1, 1] for LPIPS or flatten for cosine.
         """
+        img = _to_tensor(img)
         if img.max() > 1:
             img = img / 255.0
+
+        img = img * 2.0 - 1.0  # [0,1] → [-1,1]
         return img
 
     def _lpips_score(img1, img2):
@@ -602,7 +634,9 @@ def perceptual_score_reward_func(prompts, completions, image_gt, step=None, run_
         return 1.0 - loss_fn(img1, img2).item()  # higher is better
 
     rewards = []
-    for pred_img, gt_img in zip(image_completions, image_gt):
+    for pred_img, gt_img in zip(completions, image_gt):
+        if pred_img.size != gt_img.size:
+            gt_img = pad_to_square_and_resize(gt_img, pred_img.size[0])
         score = _lpips_score(pred_img, gt_img)
         rewards.append(score)
 

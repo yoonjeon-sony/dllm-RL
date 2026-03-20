@@ -185,13 +185,24 @@ def logit_normal_schedule(shift,sigmas):
     return sigmas
 
 INT_MAX = 1_000_000
-def get_logits(model, input_emnbeddings, modality_indices=None, t2i_inference=False, past_key_values=None,gen_shape=None,timesteps=None,input_modality_indices=None):
+def get_logits(
+    model, 
+    input_emnbeddings, 
+    modality_indices=None, 
+    t2i_inference=False, 
+    past_key_values=None,
+    gen_shape=None,
+    timesteps=None,
+    input_modality_indices=None,
+    attention_mask=None,
+    ):
     if t2i_inference:
         if input_modality_indices is None:
             input_modality_indices = modality_indices
-        output = model(
+        output = model( # LlavaLladaModel
             None,
             input_embeddings=input_emnbeddings,
+            attention_mask=attention_mask,
             modality_indices=input_modality_indices,
             return_last_hidden_state_only=True,
             compute_logits=False,
@@ -208,18 +219,12 @@ def get_logits(model, input_emnbeddings, modality_indices=None, t2i_inference=Fa
             gen_logits = gen_logits.view(-1,seq_len_per_img,*gen_logits.shape[-2:])
             # N L 8 D
         return gen_logits
-        
-        
-        final_logits = torch.zeros(*gen_logits.shape[:-1],OFFSET+gen_logits.shape[-1],dtype=output.logits.dtype,device=output.logits.device)
-        final_logits[:] = float('-inf')
-        final_logits[...,OFFSET:] = gen_logits
-
-        logits = final_logits
-        return logits
+    
     else:
         # Text-only scoring should not activate the dual-tower modality path.
         logits = model(
             None,
+            attention_mask=attention_mask,
             input_embeddings=input_emnbeddings,
             modality_indices=None,
             past_key_values=past_key_values,
